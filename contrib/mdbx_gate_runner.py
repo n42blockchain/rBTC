@@ -23,7 +23,7 @@ DEFAULTS = {
     "SEED_BATCH": 100_000, "UNDO_RETENTION": 288,
     "REPORT_INTERVAL": 10_000, "CAPACITY_BYTES": 128 * GIB,
     "COMPACT": 1, "COMPACT_PERCENT": 55, "MIN_RECLAIM_PERCENT": 10,
-    "RECOMPACT_GROWTH_PERCENT": 50,
+    "RECOMPACT_GROWTH_PERCENT": 50, "CONSUME_INPUTS": 0, "STREAM_INPUTS": 0,
 }
 SELECTOR = "mdbx_mainnet_scale_churn_and_compaction_gate"
 CRASH_SELECTOR = "abrupt_exit_at_every_compaction_boundary_recovers_exact_four_table_state"
@@ -48,18 +48,26 @@ def digest(path):
 
 
 def workload(saved=None):
-    values = dict(DEFAULTS if saved is None else saved)
+    values = dict(DEFAULTS)
+    if saved is not None:
+        values.update(saved)
     for key in DEFAULTS:
         raw = os.environ.get(PREFIX + key)
         if raw is not None:
             value = int(raw)
-            if saved is not None and value != saved[key]:
+            if saved is not None and value != values[key]:
                 raise ValueError(f"resume workload mismatch: {PREFIX + key}")
             values[key] = value
-    if any(value <= 0 for key, value in values.items() if key != "COMPACT"):
+    if any(value <= 0 for key, value in values.items() if key not in ("COMPACT", "CONSUME_INPUTS", "STREAM_INPUTS")):
         raise ValueError("workload values must be positive")
     if values["COMPACT"] not in (0, 1):
         raise ValueError("COMPACT must be 0 or 1")
+    if values["CONSUME_INPUTS"] not in (0, 1):
+        raise ValueError("CONSUME_INPUTS must be 0 or 1")
+    if values["STREAM_INPUTS"] not in (0, 1):
+        raise ValueError("STREAM_INPUTS must be 0 or 1")
+    if values["STREAM_INPUTS"] and values["CONSUME_INPUTS"]:
+        raise ValueError("STREAM_INPUTS and CONSUME_INPUTS are mutually exclusive")
     if values["UPDATES"] > values["UTXOS"]:
         raise ValueError("UPDATES must not exceed UTXOS")
     for key in ("COMPACT_PERCENT", "MIN_RECLAIM_PERCENT", "RECOMPACT_GROWTH_PERCENT"):
@@ -214,12 +222,18 @@ def validate_report(report, values, batch):
         "live_utxos": values["UTXOS"], "target_blocks": values["BLOCKS"],
         "updates_per_block": values["UPDATES"], "seed_batch": values["SEED_BATCH"],
         "commit_batch": batch, "undo_retention": values["UNDO_RETENTION"],
+        "consume_inputs": bool(values.get("CONSUME_INPUTS", 0)),
+        "stream_inputs": bool(values.get("STREAM_INPUTS", 0)),
         "capacity_bytes": values["CAPACITY_BYTES"], "compact_enabled": bool(values["COMPACT"]),
         "compact_trigger_percent": values["COMPACT_PERCENT"],
         "compact_min_reclaim_percent": values["MIN_RECLAIM_PERCENT"],
         "recompact_growth_percent": values["RECOMPACT_GROWTH_PERCENT"],
     }
-    if report.get("workload") != expected or not report.get("finished_epoch"):
+    actual = dict(report.get("workload") or {})
+    # Frozen pre-mode binaries used the borrowed entry point.
+    actual.setdefault("consume_inputs", False)
+    actual.setdefault("stream_inputs", False)
+    if actual != expected or not report.get("finished_epoch"):
         raise ValueError("report is incomplete or workload identity differs")
     audit = report.get("final_audit") or {}
     if (audit.get("tip_height") != values["BLOCKS"]

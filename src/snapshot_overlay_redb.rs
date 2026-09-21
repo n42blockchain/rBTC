@@ -43,10 +43,10 @@ use crate::{
         write_core_varint,
     },
     core_snapshot_index::{
-        CoreSnapshotUtxoIndex, SnapshotBaseIdentity, build_core_snapshot_index_with_identity,
+        CoreSnapshotUtxoIndex, SnapshotBaseIdentity, build_with_identity_and_memory,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     snapshot_overlay::{
         BaseGroupReader, META_IDENTITY, META_TIP, OverlayCapacity, RebaseReport, RemoveFilesOnDrop,
         SnapshotOverlayConfig, SnapshotOverlayError, chain_store_to_utxo, decode_identity,
@@ -92,6 +92,7 @@ pub struct SnapshotOverlayRedbChainstate {
     snapshot_path: PathBuf,
     index_path: PathBuf,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 impl SnapshotOverlayRedbChainstate {
@@ -108,11 +109,16 @@ impl SnapshotOverlayRedbChainstate {
         config: SnapshotOverlayConfig,
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
+        let memory = crate::node_memory::for_path(&config.database_dir)?;
+        let base = CoreSnapshotUtxoIndex::open_with_memory(
+            &config.index_path,
+            &config.snapshot_path,
+            memory.as_ref(),
+        )?;
         if let Some(parent) = config.database_dir.parent() {
             fs::create_dir_all(parent)?;
         }
-        let db = Database::create(&config.database_dir).map_err(overlay_redb)?;
+        let db = crate::node_memory::create_redb(&config.database_dir).map_err(overlay_redb)?;
         let identity = {
             let transaction = db.begin_write().map_err(overlay_redb)?;
             {
@@ -186,7 +192,10 @@ impl SnapshotOverlayRedbChainstate {
                 "creation-MTP table must cover exactly heights 0..=base",
             ));
         }
+        let execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(&config.database_dir)?;
         Ok(Self {
+            execution_spool,
             db,
             database_path: config.database_dir,
             base,
@@ -212,7 +221,7 @@ impl SnapshotOverlayRedbChainstate {
         if !database_path.exists() {
             return Ok(None);
         }
-        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let db = crate::node_memory::open_existing_redb(database_path).map_err(overlay_redb)?;
         let transaction = db.begin_read().map_err(overlay_redb)?;
         let meta = match transaction.open_table(META) {
             Ok(meta) => meta,
@@ -235,7 +244,7 @@ impl SnapshotOverlayRedbChainstate {
     pub fn audit_content(
         database_path: &Path,
     ) -> Result<crate::snapshot_overlay::OverlayContentAudit, SnapshotOverlayError> {
-        let db = Database::open(database_path).map_err(overlay_redb)?;
+        let db = crate::node_memory::open_existing_redb(database_path).map_err(overlay_redb)?;
         let transaction = db.begin_read().map_err(overlay_redb)?;
         let meta = transaction.open_table(META).map_err(overlay_redb)?;
         let identity = meta
@@ -499,7 +508,8 @@ impl SnapshotOverlayRedbChainstate {
     ) -> Result<RebaseReport, SnapshotOverlayError> {
         let new_snapshot_path = new_snapshot_path.as_ref();
         let new_index_path = new_index_path.as_ref();
-        if new_snapshot_path.exists() || new_index_path.exists() {
+        let fingerprint_path = crate::core_snapshot_index::fingerprint_sidecar_path(new_index_path);
+        if new_snapshot_path.exists() || new_index_path.exists() || fingerprint_path.exists() {
             return Err(SnapshotOverlayError::Invalid(
                 "rebase output paths already exist",
             ));
@@ -670,10 +680,22 @@ impl SnapshotOverlayRedbChainstate {
             block_hash: tip.hash,
             hash_serialized: sha256d::Hash::from_engine(core_hash).to_string(),
         };
-        let report =
-            build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
+        // The builder publishes the index and then its optional fingerprint
+        // sidecar. Own both paths before either publication can fail.
         cleanup.track(new_index_path.to_owned());
-        let new_base = CoreSnapshotUtxoIndex::open(new_index_path, new_snapshot_path)?;
+        cleanup.track(fingerprint_path);
+        let memory = crate::node_memory::for_path(&self.database_path)?;
+        let report = build_with_identity_and_memory(
+            new_snapshot_path,
+            new_index_path,
+            &identity,
+            memory.as_ref(),
+        )?;
+        let new_base = CoreSnapshotUtxoIndex::open_with_memory(
+            new_index_path,
+            new_snapshot_path,
+            memory.as_ref(),
+        )?;
 
         let identity_bytes = encode_identity(&identity, &new_base)?;
         {
@@ -844,10 +866,15 @@ impl<'txn> OverlayGroupReader<'txn> {
 
 impl UtxoStore for SnapshotOverlayRedbChainstate {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db.begin_read()?;
         let overlay = transaction.open_table(OVERLAY)?;
         if let Some(value) = overlay.get(outpoint.as_bytes().as_slice())? {
-            return Utxo::decode(value.value()).map(Some);
+            return Utxo::decode_with_script_limit(value.value(), limit).map(Some);
         }
         let tombstone = transaction.open_table(TOMBSTONE)?;
         if tombstone.get(outpoint.as_bytes().as_slice())?.is_some() {
@@ -863,6 +890,11 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db.begin_read()?;
         let overlay = transaction.open_table(OVERLAY)?;
         let tombstone = transaction.open_table(TOMBSTONE)?;
@@ -873,7 +905,10 @@ impl UtxoStore for SnapshotOverlayRedbChainstate {
         let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
             if let Some(value) = overlay.get(outpoint.as_bytes().as_slice())? {
-                results.push((*outpoint, Some(Utxo::decode(value.value())?)));
+                results.push((
+                    *outpoint,
+                    Some(Utxo::decode_with_script_limit(value.value(), limit)?),
+                ));
             } else if tombstone.get(outpoint.as_bytes().as_slice())?.is_some() {
                 results.push((*outpoint, None));
             } else {
@@ -986,6 +1021,10 @@ impl SnapshotOverlayRedbChainstate {
 }
 
 impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let transaction = self.db.begin_read()?;
         let meta = transaction.open_table(META)?;
@@ -1062,6 +1101,17 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
         self.commit_folded(transitions, spent, created)
     }
 
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<crate::chain_store::LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let collected = crate::chain_store::collect_transition_stream(transitions, final_tip)?;
+        self.commit_connect_batch(&collected.transitions)
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,
@@ -1118,7 +1168,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let _guard = self.lock();
@@ -1135,7 +1185,7 @@ impl ExecutionChainStore for SnapshotOverlayRedbChainstate {
                 let hash = BlockHash::from_byte_array(key);
                 let header =
                     headers
-                        .get(&hash)
+                        .header(&hash)?
                         .ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
                             "block undo references an unknown header",
                         )))?;

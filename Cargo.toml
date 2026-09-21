@@ -57,6 +57,7 @@ name = "storage_engine_comparison"
 required-features = ["mdbx"]
 
 [dependencies]
+rbtc-codec-memory = { path = "vendor/rbtc-codec-memory", version = "0.1.0" }
 ahash = "0.8.12"
 mimalloc = { version = "0.1.52", optional = true, default-features = false }
 bitcoin = { version = "=0.32.102", default-features = true }
@@ -80,16 +81,18 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "rt-
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 zstd = { version = "0.14.0", features = ["zstdmt"] }
 
+tempfile = "3.27.0"
+
 [dev-dependencies]
 proptest = "1.11.0"
 # Benchmark-only. SQLite is already linked into every build through
 # bdk_wallet's rusqlite feature, so this evaluates an engine the binary
 # already carries rather than adding one.
 rusqlite = { version = "0.31", features = ["bundled"] }
-tempfile = "3.27.0"
 tower = { version = "0.5.3", features = ["util"] }
 
 [patch.crates-io]
+zstd-sys = { path = "vendor/zstd-sys" }
 bitcoinconsensus = { path = "vendor/bitcoinconsensus" }
 # Vendored to add a safe `copy_compact` binding for `mdbx_env_copy`, which
 # upstream 0.6.6 does not expose. Keeping the `unsafe` inside the dependency

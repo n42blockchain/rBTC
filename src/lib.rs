@@ -25,10 +25,14 @@ pub mod core_snapshot;
 pub mod core_snapshot_index;
 pub mod deployments;
 pub mod diagnostics;
+pub mod execution_spool;
 pub mod execution_store;
 pub mod explorer_store;
 pub mod fee_estimator;
 pub mod feerate_diagram;
+pub mod header_candidate;
+pub mod header_index;
+mod header_storage_budget;
 pub mod header_store;
 pub mod headers;
 pub mod i2p_sam;
@@ -37,10 +41,13 @@ pub mod inbound;
 pub mod index_policy;
 pub mod ledger;
 #[cfg(feature = "mdbx")]
+mod mdbx_memory;
+#[cfg(feature = "mdbx")]
 pub mod mdbx_utxo;
 pub mod merkle_proof;
 pub mod mphf;
 pub mod node;
+pub mod node_memory;
 pub mod p2p;
 pub mod p2p_v2;
 pub mod peer_store;

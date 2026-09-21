@@ -34,7 +34,7 @@ const BOOL_KEYS: [&str; 12] = [
     "v2_transport",
     "validation_deferred_repair",
 ];
-const VALUE_KEYS: [&str; 39] = [
+const VALUE_KEYS: [&str; 40] = [
     "asmap",
     "automatic_hot_standbys",
     "assumevalid",
@@ -54,6 +54,7 @@ const VALUE_KEYS: [&str; 39] = [
     "log_max_files",
     "minimum_chainwork",
     "mempool_max_bytes",
+    "memory_budget_bytes",
     "mempool_max_transactions",
     "max_inbound_peers",
     "max_inbound_peers_per_ip",
@@ -389,6 +390,7 @@ fn flag_for_key(key: &str) -> &'static str {
         "log_max_files" => "--log-max-files",
         "minimum_chainwork" => "--minimum-chainwork",
         "mempool_max_bytes" => "--mempool-max-bytes",
+        "memory_budget_bytes" => "--memory-budget-bytes",
         "mempool_max_transactions" => "--mempool-max-transactions",
         "max_inbound_peers" => "--max-inbound-peers",
         "max_inbound_peers_per_ip" => "--max-inbound-peers-per-ip",
@@ -458,6 +460,7 @@ fn known_flag_group(argument: &str) -> Option<&'static str> {
             | "--log-max-files"
             | "--mempool-full-rbf"
             | "--mempool-max-bytes"
+            | "--memory-budget-bytes"
             | "--mempool-max-transactions"
             | "--max-inbound-peers"
             | "--max-inbound-peers-per-ip"
@@ -539,6 +542,7 @@ fn option_group(flag: &str) -> &'static str {
         "--max-upload-bytes-per-day" => "max-upload-bytes-per-day",
         "--minimum-chainwork" => "minimum-chainwork",
         "--mempool-max-bytes" => "mempool-max-bytes",
+        "--memory-budget-bytes" => "memory-budget-bytes",
         "--mempool-max-transactions" => "mempool-max-transactions",
         "--minimum-free-bytes" => "minimum-free-bytes",
         "--name-proxy" => "name-proxy",

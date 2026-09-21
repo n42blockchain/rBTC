@@ -46,8 +46,9 @@ prune_blocks=1008
 prune_max_bytes=1073741824
 minimum_free_bytes=5368709120
 chainstate_cache_bytes=1073741824
-background_chainstate_cache_bytes=8589934592
-bulk_validation_cache_bytes=17179869184
+background_chainstate_cache_bytes=4294967296
+bulk_validation_cache_bytes=8589934592
+memory_budget_bytes=34359738368
 
 [bitcoin]
 connect=203.0.113.10:8333
@@ -269,3 +270,77 @@ must not be a symlink. Authenticated `getloginfo` reports the effective level
 and dropped count; `setloglevel ["error"|"warn"|"info"|"debug"]` changes the
 level without restart. Embedded hosts do not install this process-global sink
 and instead consume the bounded typed status/event receivers.
+
+`memory_budget_bytes` (`--memory-budget-bytes`) caps shared reservations for
+chainstate and supporting redb caches, Headers caches/read buffers and admission candidates. The
+default is 32 GiB. Startup counts persistent peer, mempool and fee-estimator caches, both background
+pipelines, optional indexes, explorer and wallet rebroadcast caches. It rejects
+a known simultaneous cache plan that cannot
+leave 1 GiB for Headers/candidates; it does not silently shrink explicit cache
+settings. The status API exposes `memory_reservations` (limit, used, peak).
+Node-bound redb, MDBX and snapshot-overlay batch paths (without indexes
+requesting applied undo copies) spool completed preparation to anonymous files
+beside the database path. MDBX temporary results stay outside the environment
+directory so its maintenance rename does not move them.
+`execution_spool_reservations` reports its shared 16 GiB logical disk allowance;
+it also covers anonymous archive-compression scratch, admitted conservatively
+at the maximum archive-container size before compression. This is independent
+of Header file admission and is not a physical whole-node disk quota. Execution
+result encoding and decoding reserve from the node memory allowance. File archive
+decoders reserve their bounded native context and Rust input buffer before
+creation. Piece hashing and record scans reserve scratch; returned archive
+payloads and handle arrays retain reservations through shared clones and node
+replay staging. File manifest parsing reserves temporary scratch and bounded
+immutable metadata that stays charged through its last alias. File writers
+admit result metadata and fixed JSON/piece scratch before compression as well.
+Node-bound archive encoders admit each native heap allocation (including worker
+contexts), a fixed tracking table and their Rust output buffer. The pinned
+vendored codec includes allocation-failure cleanup fixes; system zstd overrides
+are rejected. OS worker stacks, allocator overhead, newly serialized network
+payloads and other node batch objects still need accounting.
+These reservation limits do not establish a whole-node RSS ceiling.
+Memory and execution-spool admission failures retain distinct internal error
+types through archive/execution paths. Both are local failures and do not penalize
+peers. Typed memory pressure can retry with successively halved block windows while
+the execution tip is unchanged and no deferred scripts remain. If a stage existed
+at entry, every retry must verify its original complete identity; if none existed,
+a newly created stage prevents retry. Missing, changed, corrupt or unreadable
+stages fail closed. The retry window is capped by the remaining staged blocks.
+Retries disable network and replay read-ahead and stop if one block cannot fit.
+Disk pressure and failures after execution commit still stop the session; a smaller
+read is not a guarantee that later publication will have enough memory.
+On resumption, a matching stage is revalidated and consumed in batches within the
+current batch/height limits. The complete stage stays immutable while executed
+prefixes are published; only final publication removes it. Normal and overlay
+startup recover matching committed prefixes before resuming the remaining blocks.
+Publication failures may require reopening the ledger to recover its slot/index
+state. Automatic publication retries and fair waiting for shared resources remain
+open. Physical I/O failures are not inferred to be reservation exhaustion from
+their text.
+Temporary results disappear on close/process death; restart replays durable raw
+blocks from the committed execution checkpoint. Parallel output deltas and
+their version index reserve a conservative allowance before construction.
+Input discovery and batch overlay maps reserve before construction; prefetch
+reads use 128-key chunks and retain actual returned script allowances through
+read-ahead refresh and overlay ownership transfer. Node-bound ordinary Redb/MDBX
+and mutable snapshot-overlay coin queries reject scripts over 10,000 bytes
+before copying them; MDBX read-only queries borrow raw records. Immutable
+snapshot-base queries use a 192-byte probe and fixed 16 KiB streaming buffer
+for large groups. Snapshot-index startup readers, MPHF decode and fingerprint
+caches reserve from the same owner, including external base paths and old/new
+indexes during rebase. File and embedded AS-map payloads also reserve before
+reading/copying and retain their charge through the last shared map view.
+Snapshot/index building, caller-created MTP tables,
+journal reads, other engine-internal allocations, preparation copies, script queues,
+thread stacks and indexed undo copies still require further accounting.
+These are reservation bytes, not RSS: execution batches, engine dirty/MVCC
+pages, SQLite, MDBX and other unregistered allocations still require
+integration and whole-node acceptance. The overall memory gate remains open.
+
+The supporting redb caches retain their existing 1 GiB defaults. A normal node
+without optional services therefore needs at least 5 GiB in this preflight
+(1 GiB chainstate + 3 GiB supporting caches + 1 GiB headroom). Two background
+pipelines need at least 13 GiB before optional services/indexes. Enabling all
+three indexes in both pipelines raises that plan to 19 GiB, within the default
+32 GiB allowance. Smaller hosts can override `memory_budget_bytes` explicitly. These are configured reservation plans, not
+measured resident memory minima.

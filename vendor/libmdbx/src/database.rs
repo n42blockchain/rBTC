@@ -545,6 +545,14 @@ impl Info {
         self.0.mi_mapsize as usize
     }
 
+    /// Whether the environment explicitly disables operating-system readahead.
+    /// This flag does not measure or cap resident mapped pages.
+    #[inline]
+    pub fn read_ahead_disabled(&self) -> bool {
+        // Bindgen uses signed enum constants on Windows, unsigned on Unix.
+        i64::from(self.0.mi_mode) & i64::from(ffi::MDBX_NORDAHEAD) != 0
+    }
+
     /// Last used page number
     #[inline]
     pub fn last_pgno(&self) -> usize {

@@ -39,6 +39,9 @@ pub enum MphfError {
     /// cannot reach; the key set contains duplicates.
     #[error("keys were not placed after {MAX_LEVELS} levels; the key set contains duplicates")]
     Unresolvable,
+    /// Construction could not admit its working memory.
+    #[error("MPHF build memory: {0}")]
+    Memory(#[from] std::io::Error),
     /// A persisted representation is not canonical.
     #[error("malformed minimal perfect hash function: {0}")]
     Malformed(&'static str),
@@ -52,6 +55,8 @@ struct Level {
     rank_before: u64,
     /// Cumulative set bits before each `RANK_BLOCK_WORDS` block of `words`.
     rank_samples: Vec<u64>,
+    // Payloads must drop before their reservation.
+    _memory: Option<crate::node_memory::MemoryLease>,
 }
 
 impl Level {
@@ -70,6 +75,7 @@ impl Level {
             words,
             rank_before,
             rank_samples,
+            _memory: None,
         }
     }
 
@@ -103,6 +109,7 @@ pub struct Mphf {
     seed: u64,
     key_count: u64,
     levels: Vec<Level>,
+    _memory: Option<crate::node_memory::MemoryLease>,
 }
 
 impl Mphf {
@@ -120,11 +127,33 @@ impl Mphf {
         K: AsRef<[u8]>,
         F: Fn(u64) -> K,
     {
+        Self::build_with_memory(key_count, key_at, seed, None)
+    }
+
+    pub(crate) fn build_with_memory<K, F>(
+        key_count: u64,
+        key_at: F,
+        seed: u64,
+        memory: Option<&crate::node_memory::MemoryBudget>,
+    ) -> Result<Self, MphfError>
+    where
+        K: AsRef<[u8]>,
+        F: Fn(u64) -> K,
+    {
         if key_count == 0 {
             return Err(MphfError::Empty);
         }
+        let ordinal_bytes = allocation_bytes(key_count, 8)?;
+        let _ordinals = memory
+            .map(|budget| budget.reserve(ordinal_bytes))
+            .transpose()?;
+        let reservation = memory
+            .map(|budget| {
+                budget.reserve(u64::from(MAX_LEVELS) * std::mem::size_of::<Level>() as u64)
+            })
+            .transpose()?;
         let mut remaining: Vec<u64> = (0..key_count).collect();
-        let mut levels = Vec::new();
+        let mut levels = Vec::with_capacity(MAX_LEVELS as usize);
         let mut rank_before = 0_u64;
         while !remaining.is_empty() {
             let level_index =
@@ -132,29 +161,14 @@ impl Mphf {
             if level_index == MAX_LEVELS {
                 return Err(MphfError::Unresolvable);
             }
-            let keys_here = u64::try_from(remaining.len()).expect("ordinal count fits u64");
-            let bit_count = (keys_here * GAMMA).max(64).next_multiple_of(64);
-            let word_count = usize_from(bit_count / 64);
-            let mut first_hit = vec![0_u64; word_count];
-            let mut collided = vec![0_u64; word_count];
-            for &ordinal in &remaining {
-                let position = position(seed, level_index, key_at(ordinal).as_ref(), bit_count);
-                if get_bit(&first_hit, position) {
-                    set_bit(&mut collided, position);
-                } else {
-                    set_bit(&mut first_hit, position);
-                }
-            }
-            let words: Vec<u64> = first_hit
-                .iter()
-                .zip(&collided)
-                .map(|(hit_word, collided_word)| hit_word & !collided_word)
-                .collect();
-            remaining.retain(|&ordinal| {
-                let position = position(seed, level_index, key_at(ordinal).as_ref(), bit_count);
-                get_bit(&collided, position)
-            });
-            let level = Level::new(bit_count, words, rank_before);
+            let level = build_level(
+                &mut remaining,
+                &key_at,
+                seed,
+                level_index,
+                rank_before,
+                memory,
+            )?;
             rank_before += level.set_bits();
             levels.push(level);
         }
@@ -165,6 +179,7 @@ impl Mphf {
             seed,
             key_count,
             levels,
+            _memory: reservation,
         })
     }
 
@@ -215,6 +230,20 @@ impl Mphf {
                 out.extend_from_slice(&word.to_le_bytes());
             }
         }
+    }
+
+    /// Writes the canonical encoding without constructing an encoded copy.
+    pub(crate) fn write_to<W: std::io::Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        out.write_all(&self.seed.to_le_bytes())?;
+        out.write_all(&self.key_count.to_le_bytes())?;
+        out.write_all(&self.level_count().to_le_bytes())?;
+        for level in &self.levels {
+            out.write_all(&level.bit_count.to_le_bytes())?;
+            for word in &level.words {
+                out.write_all(&word.to_le_bytes())?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the exact persisted length in bytes.
@@ -277,10 +306,67 @@ impl Mphf {
                 seed,
                 key_count,
                 levels,
+                _memory: None,
             },
             cursor,
         ))
     }
+}
+
+fn allocation_bytes(count: u64, width: u64) -> Result<u64, MphfError> {
+    count
+        .checked_mul(width)
+        .filter(|bytes| isize::try_from(*bytes).is_ok())
+        .ok_or_else(|| std::io::Error::other("MPHF allocation size overflow").into())
+}
+
+fn build_level<K: AsRef<[u8]>>(
+    remaining: &mut Vec<u64>,
+    key_at: &impl Fn(u64) -> K,
+    seed: u64,
+    level_index: u32,
+    rank_before: u64,
+    memory: Option<&crate::node_memory::MemoryBudget>,
+) -> Result<Level, MphfError> {
+    let bit_count = (remaining.len() as u64)
+        .checked_mul(GAMMA)
+        .and_then(|bits| bits.max(64).checked_next_multiple_of(64))
+        .ok_or_else(|| std::io::Error::other("MPHF level size overflow"))?;
+    let word_count = bit_count / 64;
+    let word_bytes = allocation_bytes(word_count, 8)?;
+    let rank_bytes = allocation_bytes(word_count.div_ceil(RANK_BLOCK_WORDS), 8)?;
+    let allowance = word_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(rank_bytes))
+        .ok_or_else(|| std::io::Error::other("MPHF level allowance overflow"))?;
+    let mut reservation = memory.map(|budget| budget.reserve(allowance)).transpose()?;
+    let mut words = vec![0_u64; usize_from(word_count)];
+    let mut collided = vec![0_u64; usize_from(word_count)];
+    for &ordinal in remaining.iter() {
+        let position = position(seed, level_index, key_at(ordinal).as_ref(), bit_count);
+        if get_bit(&words, position) {
+            set_bit(&mut collided, position);
+        } else {
+            set_bit(&mut words, position);
+        }
+    }
+    // Reuse the first-hit allocation instead of retaining a third bit array.
+    for (word, collisions) in words.iter_mut().zip(&collided) {
+        *word &= !collisions;
+    }
+    remaining.retain(|&ordinal| {
+        let position = position(seed, level_index, key_at(ordinal).as_ref(), bit_count);
+        get_bit(&collided, position)
+    });
+    drop(collided);
+    let level = Level::new(bit_count, words, rank_before);
+    if let Some(reservation) = &mut reservation {
+        reservation.shrink_to(word_bytes + rank_bytes)?;
+    }
+    Ok(Level {
+        _memory: reservation,
+        ..level
+    })
 }
 
 fn position(seed: u64, level_index: u32, key: &[u8], bit_count: u64) -> u64 {
@@ -315,6 +401,22 @@ fn take<'bytes>(
     Ok(slice)
 }
 
+impl Mphf {
+    /// Heap capacity retained after decoding, including rank and level tables.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        let levels = self
+            .levels
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Level>());
+        let bytes = self.levels.iter().fold(levels, |total, level| {
+            total
+                .saturating_add(level.words.capacity().saturating_mul(8))
+                .saturating_add(level.rank_samples.capacity().saturating_mul(8))
+        });
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -330,6 +432,95 @@ mod tests {
             keys.insert(key);
         }
         keys.into_iter().collect()
+    }
+
+    #[test]
+    fn streamed_encoding_matches_legacy_bytes_and_propagates_short_write_failure() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let length = bytes
+                    .len()
+                    .min(3)
+                    .min(self.limit.saturating_sub(self.bytes.len()));
+                if length == 0 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                self.bytes.extend_from_slice(&bytes[..length]);
+                Ok(length)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let keys = random_keys(1000, 7);
+        let mphf = Mphf::build(1000, |ordinal| keys[usize_from(ordinal)], 42).unwrap();
+        let mut expected = Vec::new();
+        mphf.encode_into(&mut expected);
+        let mut out = ShortWriter {
+            bytes: Vec::new(),
+            limit: usize::MAX,
+        };
+        mphf.write_to(&mut out).unwrap();
+        assert_eq!(out.bytes, expected);
+        let mut failing = ShortWriter {
+            bytes: Vec::new(),
+            limit: 37,
+        };
+        assert!(mphf.write_to(&mut failing).is_err());
+        assert_eq!(failing.bytes, expected[..37]);
+    }
+
+    #[test]
+    fn build_memory_denial_precedes_key_access_and_retains_live_levels() {
+        use crate::node_memory::MemoryBudget;
+        let keys = random_keys(1000, 7);
+        let level_bytes = u64::from(MAX_LEVELS) * std::mem::size_of::<Level>() as u64;
+        // First deny ordinals, then deny the level scratch after admitting ordinals.
+        for limit in [0, 8000 + level_bytes] {
+            let budget = MemoryBudget::new(limit);
+            let result = Mphf::build_with_memory(
+                1000,
+                |_| -> [u8; 32] { panic!("key access before scratch admission") },
+                42,
+                Some(&budget),
+            );
+            assert!(matches!(result, Err(MphfError::Memory(_))));
+            assert_eq!(budget.snapshot().used, 0);
+        }
+        let budget = MemoryBudget::new(1 << 20);
+        let mphf =
+            Mphf::build_with_memory(1000, |i| keys[usize_from(i)], 42, Some(&budget)).unwrap();
+        let retained = budget.snapshot().used;
+        assert_eq!(retained, mphf.resident_bytes());
+        assert!(budget.snapshot().peak > retained);
+        let mut encoded = Vec::new();
+        mphf.encode_into(&mut encoded);
+        let (decoded, _) = Mphf::decode(&encoded).unwrap();
+        for key in &keys {
+            assert_eq!(mphf.index(key), decoded.index(key));
+        }
+        let pressure = budget.reserve(budget.snapshot().limit - retained).unwrap();
+        assert!(matches!(
+            Mphf::build_with_memory(1, |_| [1_u8], 42, Some(&budget)),
+            Err(MphfError::Memory(_))
+        ));
+        drop(pressure);
+        assert_eq!(budget.snapshot().used, retained);
+        drop(mphf);
+        assert_eq!(budget.snapshot().used, 0);
+        assert!(matches!(
+            Mphf::build_with_memory(2, |_| [5_u8], 42, Some(&budget)),
+            Err(MphfError::Unresolvable)
+        ));
+        assert_eq!(budget.snapshot().used, 0);
+        assert!(matches!(
+            Mphf::build(u64::MAX, |_| [0_u8], 1),
+            Err(MphfError::Memory(_))
+        ));
     }
 
     #[test]

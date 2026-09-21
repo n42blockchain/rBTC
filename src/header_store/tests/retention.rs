@@ -26,6 +26,81 @@ fn leaf_first(side: &[Header]) -> Vec<BlockHash> {
 }
 
 #[test]
+fn recovery_cursor_is_atomic_durable_and_cleared_by_eviction() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    let (mut dag, active, side) = branches();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    store
+        .append_recovery_batch(&active, active[2].block_hash())
+        .unwrap();
+    // Failure after inserting every row must abort both the rows and cursor.
+    assert!(
+        store
+            .append_recovery_batch(&side, BlockHash::all_zeros())
+            .is_err()
+    );
+    assert_eq!(store.len().unwrap(), 3);
+    assert_eq!(store.recovery_tip().unwrap(), Some(active[2].block_hash()));
+    store
+        .append_recovery_batch(&side, side[1].block_hash())
+        .unwrap();
+    drop(store);
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
+    assert!(
+        store
+            .append_recovery_batch(&active, active[2].block_hash())
+            .is_err()
+    );
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
+    let stage = dag
+        .stage_leaf_evictions(&leaf_first(&side), &[], 2)
+        .unwrap();
+    store.persist_eviction(&stage).unwrap();
+    stage.commit();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    store
+        .append_recovery_batch(&[], active[2].block_hash())
+        .unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(active[2].block_hash()));
+    store.clear_recovery_tip().unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), None);
+    assert_eq!(store.len().unwrap(), 3);
+}
+
+#[test]
+fn ingress_capacity_defers_atomically_and_rollback_restores_capacity() {
+    let (mut dag, _, side) = branches();
+    let before = dag.active_tip();
+    let count = dag.retained_header_count();
+    let child = mine_child(side[1].block_hash(), side[1].time + 1);
+    let error = match dag.stage_batch_contextual_with_limit(&[child], child.time, count - 1) {
+        Ok(_) => panic!("full DAG must defer before mutation"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        crate::headers::HeaderError::ResourceDeferred { .. }
+    ));
+    assert!(!error.is_peer_invalid());
+    assert_eq!(dag.retained_header_count(), count);
+    assert_eq!(dag.active_tip(), before);
+    drop(
+        dag.stage_batch_contextual_with_limit(&[child], child.time, count)
+            .unwrap(),
+    );
+    assert_eq!(dag.retained_header_count(), count);
+    assert!(dag.get(&child.block_hash()).is_none());
+    let _ = dag
+        .stage_batch_contextual_with_limit(&[child], child.time, count)
+        .unwrap()
+        .commit();
+    assert_eq!(dag.retained_header_count(), count + 1);
+}
+
+#[test]
 fn retention_protects_context_and_rolls_back_partial_plans() {
     let (mut dag, active, side) = branches();
     let tip = dag.active_tip();
@@ -151,7 +226,9 @@ fn failed_durable_eviction_aborts_every_row_and_restores_the_dag() {
     let store = RedbHeaderStore::open(directory.path().join("headers.redb")).unwrap();
     let (mut dag, active, side) = branches();
     store.append_batch(&active).unwrap();
-    store.append_batch(&side).unwrap();
+    store
+        .append_recovery_batch(&side, side[1].block_hash())
+        .unwrap();
     // Inject a stale reverse index for the second removal. The first removal
     // has already happened inside the uncommitted redb transaction when it fails.
     let transaction = store.db.begin_write().unwrap();
@@ -170,6 +247,7 @@ fn failed_durable_eviction_aborts_every_row_and_restores_the_dag() {
     assert_eq!(dag.active_tip(), before);
     assert_eq!(dag.retained_header_count(), 6);
     assert_eq!(store.len().unwrap(), 5);
+    assert_eq!(store.recovery_tip().unwrap(), Some(side[1].block_hash()));
     let transaction = store.db.begin_read().unwrap();
     let headers = transaction.open_table(HEADERS).unwrap();
     for header in &side {
@@ -476,4 +554,168 @@ fn eviction_candidates_break_chainwork_ties_by_ascending_hash() {
     siblings.sort_by_key(|header| header.block_hash().to_byte_array());
     let expected: Vec<BlockHash> = siblings.iter().map(Header::block_hash).collect();
     assert_eq!(dag.select_side_chain_eviction_candidates(&[], 0), expected);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn disk_candidate_promotion_is_atomic_bounded_and_idempotent() {
+    use crate::{
+        header_candidate::{DiskHeaderCandidate, HeaderCandidateLimits},
+        headers::HeaderWorkBudget,
+    };
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    let (_, active, side) = branches();
+    let mut dag = HeaderDag::new(Network::Regtest);
+    let anchor = dag.active_tip().hash;
+    let _ = dag
+        .stage_batch_contextual(&active, u32::MAX)
+        .unwrap()
+        .commit();
+    store.append_batch(&active).unwrap();
+    let original = dag.active_tip();
+    let mut candidate = DiskHeaderCandidate::open(
+        directory.path().join("candidate"),
+        &dag,
+        anchor,
+        u32::MAX,
+        HeaderCandidateLimits::default(),
+        &mut HeaderWorkBudget::default(),
+    )
+    .unwrap();
+    candidate
+        .append(&side, u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert!(
+        !store
+            .promote_candidate(
+                &mut dag,
+                &mut candidate,
+                u32::MAX,
+                1_000_000,
+                &mut HeaderWorkBudget::default()
+            )
+            .unwrap()
+    );
+    let third = mine_child(side[1].block_hash(), side[1].time + 1);
+    let fourth = mine_child(third.block_hash(), third.time + 1);
+    candidate
+        .append(&[third, fourth], u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert!(
+        store
+            .promote_candidate(
+                &mut dag,
+                &mut candidate,
+                u32::MAX,
+                1,
+                &mut HeaderWorkBudget::default()
+            )
+            .is_err()
+    );
+    assert_eq!(dag.active_tip(), original);
+    assert_eq!(store.len().unwrap(), 3);
+    // Force the durable transaction to fail after inserting its first row.
+    let transaction = store.db.begin_write().unwrap();
+    transaction
+        .open_table(META)
+        .unwrap()
+        .insert(NEXT_SEQUENCE_KEY, (u64::MAX - 1).to_le_bytes().as_slice())
+        .unwrap();
+    transaction.commit().unwrap();
+    assert!(
+        store
+            .promote_candidate(
+                &mut dag,
+                &mut candidate,
+                u32::MAX,
+                1_000_000,
+                &mut HeaderWorkBudget::default()
+            )
+            .is_err()
+    );
+    assert_eq!(dag.active_tip(), original);
+    assert_eq!(dag.retained_header_count(), 4);
+    assert_eq!(store.len().unwrap(), 3);
+    assert_eq!(candidate.len(), 4);
+    let transaction = store.db.begin_write().unwrap();
+    transaction
+        .open_table(META)
+        .unwrap()
+        .insert(NEXT_SEQUENCE_KEY, 3_u64.to_le_bytes().as_slice())
+        .unwrap();
+    transaction.commit().unwrap();
+    assert!(
+        store
+            .promote_candidate(
+                &mut dag,
+                &mut candidate,
+                u32::MAX,
+                1_000_000,
+                &mut HeaderWorkBudget::default()
+            )
+            .unwrap()
+    );
+    assert_eq!(dag.active_tip(), candidate.tip());
+    assert_eq!(store.len().unwrap(), 7);
+    drop(store);
+    let store = RedbHeaderStore::open(path).unwrap();
+    let mut restored = store.load_dag(Network::Regtest, u32::MAX).unwrap();
+    assert_eq!(restored.active_tip(), candidate.tip());
+    assert!(
+        store
+            .promote_candidate(
+                &mut restored,
+                &mut candidate,
+                u32::MAX,
+                0,
+                &mut HeaderWorkBudget::new(0)
+            )
+            .unwrap()
+    );
+    assert_eq!(store.len().unwrap(), 7);
+}
+
+#[test]
+fn failed_raw_import_aborts_the_staged_disk_index() {
+    use crate::{
+        header_index::DiskHeaderIndex,
+        headers::{HeaderView, HeaderWorkBudget},
+    };
+    let directory = tempfile::TempDir::new().unwrap();
+    let store = RedbHeaderStore::open(directory.path().join("headers")).unwrap();
+    let mut index = DiskHeaderIndex::create_scratch(
+        directory.path(),
+        DeploymentConfig::for_network(Network::Regtest),
+    )
+    .unwrap();
+    let old = index.snapshot().unwrap();
+    let first = mine_child(old.active_tip().hash, old.active_tip().header.time + 1);
+    let second = mine_child(first.block_hash(), first.time + 1);
+    let batch = [first, second];
+    let transaction = store.db.begin_write().unwrap();
+    transaction
+        .open_table(META)
+        .unwrap()
+        .insert(NEXT_SEQUENCE_KEY, (u64::MAX - 1).to_le_bytes().as_slice())
+        .unwrap();
+    transaction.commit().unwrap();
+    let stage = index
+        .stage(&batch, u32::MAX, &mut HeaderWorkBudget::default())
+        .unwrap();
+    assert!(store.append_batch(&batch).is_err());
+    drop(stage);
+    assert_eq!(store.len().unwrap(), 0);
+    assert!(index.is_empty());
+    assert_eq!(index.snapshot().unwrap().active_tip(), old.active_tip());
+    assert_eq!(
+        index
+            .snapshot()
+            .unwrap()
+            .header(&first.block_hash())
+            .unwrap(),
+        None
+    );
+    assert_eq!(old.header(&second.block_hash()).unwrap(), None);
 }

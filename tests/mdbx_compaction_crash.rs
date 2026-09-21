@@ -77,6 +77,7 @@ fn seed(path: &std::path::Path) -> [u8; 32] {
 
 fn phase_name(phase: MdbxCompactionPhase) -> &'static str {
     match phase {
+        MdbxCompactionPhase::SourceClosed => "source-closed",
         MdbxCompactionPhase::CopySynced => "copy-synced",
         MdbxCompactionPhase::SourceRenamed => "source-renamed",
         MdbxCompactionPhase::SourceRenameSynced => "source-rename-synced",
@@ -87,6 +88,7 @@ fn phase_name(phase: MdbxCompactionPhase) -> &'static str {
 
 fn parse_phase(value: &str) -> MdbxCompactionPhase {
     [
+        MdbxCompactionPhase::SourceClosed,
         MdbxCompactionPhase::CopySynced,
         MdbxCompactionPhase::SourceRenamed,
         MdbxCompactionPhase::SourceRenameSynced,
@@ -122,6 +124,7 @@ fn mdbx_compaction_crash_worker() {
 fn abrupt_exit_at_every_compaction_boundary_recovers_exact_four_table_state() {
     let executable = env::current_exe().expect("test executable");
     for phase in [
+        MdbxCompactionPhase::SourceClosed,
         MdbxCompactionPhase::CopySynced,
         MdbxCompactionPhase::SourceRenamed,
         MdbxCompactionPhase::SourceRenameSynced,

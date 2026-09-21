@@ -17,7 +17,7 @@ use std::{
 use bitcoin::{BlockHash, OutPoint, Txid, hashes::Hash};
 use rbtc::{
     OutPointKey, Utxo,
-    chain_store::{ConnectTransition, ExecutionChainStore},
+    chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     execution_store::ExecutionTip,
     mdbx_utxo::{
         DEFAULT_CHAINSTATE_CAPACITY_BYTES, DEFAULT_COMPACTION_MIN_RECLAIM_PERCENT,
@@ -43,6 +43,8 @@ struct WorkloadReport {
     updates_per_block: u32,
     seed_batch: u64,
     commit_batch: u32,
+    consume_inputs: bool,
+    stream_inputs: bool,
     undo_retention: u32,
     capacity_bytes: u64,
     compact_enabled: bool,
@@ -326,6 +328,82 @@ fn write_report(path: &Path, report: &GateReport) {
     fs::rename(temporary, path).expect("publish gate report");
 }
 
+fn commit_generated_batch(
+    store: &MdbxUtxoStore,
+    start: u32,
+    end: u32,
+    live_utxos: u64,
+    updates_per_block: u32,
+    consume_inputs: bool,
+    stream_inputs: bool,
+) -> Result<(), ChainStoreError> {
+    let count = usize::try_from(end - start).expect("bounded commit batch");
+    let generated = (0..count).map(|index| {
+        transition(
+            start + u32::try_from(index).expect("bounded batch") + 1,
+            live_utxos,
+            updates_per_block,
+        )
+    });
+    if stream_inputs {
+        // Identical transitions and one atomic checkpoint, generated on demand
+        // through the production streaming entry point without a batch Vec.
+        let mut generated = generated.map(|transition| Ok(transition.into()));
+        store.commit_connect_batch_stream(
+            &mut generated,
+            Some(ExecutionTip {
+                height: end,
+                hash: block_hash(end),
+            }),
+        )
+    } else {
+        let transitions = generated.collect::<Vec<_>>();
+        if consume_inputs {
+            store.commit_connect_batch_owned(transitions)
+        } else {
+            store.commit_connect_batch(&transitions)
+        }
+    }
+}
+
+#[test]
+fn generated_stream_matches_borrowed_and_owned_content_after_reopen() {
+    let root = tempfile::tempdir().unwrap();
+    let mut expected = None;
+    for (name, consume, stream) in [
+        ("borrowed", false, false),
+        ("owned", true, false),
+        ("stream", false, true),
+    ] {
+        let path = root.path().join(name);
+        let store = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: block_hash(0),
+            })
+            .unwrap();
+        let coins = (0..128)
+            .map(|slot| (outpoint(slot, 0), coin(0)))
+            .collect::<Vec<_>>();
+        store.apply(&[], &coins).unwrap();
+        for start in [0, 8, 16, 24] {
+            commit_generated_batch(&store, start, start + 8, 128, 16, consume, stream).unwrap();
+        }
+        drop(store);
+        let store = MdbxUtxoStore::open_with_capacity(&path, 64 * 1024 * 1024).unwrap();
+        let audit = store.audit().unwrap();
+        assert_eq!(audit.hot_entries + audit.cold_entries, 128);
+        assert_eq!(audit.undo_entries, 32);
+        assert_eq!(store.execution_tip().unwrap().height, 32);
+        if let Some(expected) = expected {
+            assert_eq!(audit.content_sha256, expected);
+        } else {
+            expected = Some(audit.content_sha256);
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires an explicit isolated directory and enough time/disk for the selected scale"]
 #[allow(clippy::too_many_lines)]
@@ -345,6 +423,12 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
     let capacity_bytes = env_u64(
         "RBTC_MDBX_GATE_CAPACITY_BYTES",
         DEFAULT_CHAINSTATE_CAPACITY_BYTES,
+    );
+    let consume_inputs = enabled("RBTC_MDBX_GATE_CONSUME_INPUTS", false);
+    let stream_inputs = enabled("RBTC_MDBX_GATE_STREAM_INPUTS", false);
+    assert!(
+        !(consume_inputs && stream_inputs),
+        "input modes are mutually exclusive"
     );
     let compact_enabled = enabled("RBTC_MDBX_GATE_COMPACT", true);
     let compact_trigger_percent = env_u8(
@@ -388,6 +472,8 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
             updates_per_block,
             seed_batch,
             commit_batch,
+            consume_inputs,
+            stream_inputs,
             undo_retention,
             capacity_bytes,
             compact_enabled,
@@ -450,14 +536,21 @@ fn mdbx_mainnet_scale_churn_and_compaction_gate() {
     let mut last_compacted_bytes = report.compactions.last().map(|row| row.after_bytes);
     while tip.height < target_blocks {
         let end = tip.height.saturating_add(commit_batch).min(target_blocks);
-        let transitions = (tip.height + 1..=end)
-            .map(|height| transition(height, live_utxos, updates_per_block))
-            .collect::<Vec<_>>();
-        store.commit_connect_batch(&transitions).unwrap();
         let previous_tip = tip.height;
-        tip = transitions.last().expect("non-empty batch").next;
-        // Keep maintenance from overlapping the already committed input batch.
-        drop(transitions);
+        commit_generated_batch(
+            &store,
+            tip.height,
+            end,
+            live_utxos,
+            updates_per_block,
+            consume_inputs,
+            stream_inputs,
+        )
+        .unwrap();
+        tip = ExecutionTip {
+            height: end,
+            hash: block_hash(end),
+        };
         let previous_prune = previous_tip.saturating_sub(undo_retention);
         let prune_through = tip.height.saturating_sub(undo_retention);
         if prune_through > previous_prune {

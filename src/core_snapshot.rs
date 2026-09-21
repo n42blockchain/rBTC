@@ -26,7 +26,7 @@ use crate::{
     chain_store::{ChainStoreError, RedbChainStore, SnapshotContentIdentity},
     chainstate::MAX_MONEY_SATS,
     execution_store::ExecutionTip,
-    headers::HeaderDag,
+    headers::{HeaderReadError, HeaderView},
     snapshot::{Core31AssumeUtxoAnchor, core31_assumeutxo_anchors},
     utxo::{OutPointKey, Utxo, UtxoError},
 };
@@ -47,6 +47,9 @@ const BBHASH_GAMMA: usize = 2;
 /// Failures while parsing or authenticating a Bitcoin Core UTXO snapshot.
 #[derive(Debug, Error)]
 pub enum CoreSnapshotError {
+    /// Reading the validated header view failed locally.
+    #[error("header view: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// Filesystem access failed.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -258,7 +261,7 @@ impl CoreSnapshotIndex {
     pub fn get(
         &mut self,
         outpoint: OutPointKey,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         last_touched: u64,
     ) -> Result<Option<Utxo>, CoreSnapshotError> {
         if headers.network() != self.metadata.network {
@@ -370,7 +373,7 @@ impl VerifiedCore31Snapshot {
     pub fn assume_into(
         self,
         store: &RedbChainStore,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         hot_window_secs: u64,
     ) -> Result<CoreSnapshotMetadata, CoreSnapshotError> {
         validate_anchor(headers, self.metadata, self.anchor)?;
@@ -408,7 +411,7 @@ impl VerifiedCore31Snapshot {
 /// exact base on the selected maximum-work header chain.
 pub fn verify_core31_snapshot(
     path: impl AsRef<Path>,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     import_time: u64,
 ) -> Result<VerifiedCore31Snapshot, CoreSnapshotError> {
     let path = path.as_ref();
@@ -569,7 +572,7 @@ const fn compact_size_len(value: u64) -> u64 {
 fn read_indexed_coin(
     reader: &mut impl Read,
     base_height: u32,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     last_touched: u64,
 ) -> Result<Utxo, CoreSnapshotError> {
     let code = read_core_varint(reader)?;
@@ -590,10 +593,10 @@ fn read_indexed_coin(
         0
     } else {
         let parent = headers
-            .active_header_at(height - 1)
+            .active_header(height - 1)?
             .ok_or(CoreSnapshotError::Invalid("missing creation header"))?;
         headers
-            .median_time_past(parent.hash)
+            .median_time_past(parent.hash)?
             .ok_or(CoreSnapshotError::Invalid("missing creation MTP"))?
     };
     Ok(Utxo {
@@ -936,7 +939,7 @@ pub(crate) fn find_anchor(
 }
 
 fn validate_anchor(
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     metadata: CoreSnapshotMetadata,
     anchor: Core31AssumeUtxoAnchor,
 ) -> Result<(), CoreSnapshotError> {
@@ -944,7 +947,7 @@ fn validate_anchor(
         return Err(CoreSnapshotError::NetworkMismatch);
     }
     if headers
-        .active_header_at(anchor.height)
+        .active_header(anchor.height)?
         .is_none_or(|header| header.hash != metadata.base_block_hash)
     {
         return Err(CoreSnapshotError::AnchorMismatch);
@@ -960,7 +963,7 @@ struct CoreCoinReader<'a, R> {
     previous_outpoint: Option<OutPointKey>,
     core_hash: sha256::HashEngine,
     base_height: u32,
-    headers: &'a HeaderDag,
+    headers: &'a dyn HeaderView,
     import_time: u64,
     finished: bool,
 }
@@ -970,7 +973,7 @@ impl<'a, R: Read> CoreCoinReader<'a, R> {
         reader: R,
         coins_count: u64,
         base_height: u32,
-        headers: &'a HeaderDag,
+        headers: &'a dyn HeaderView,
         import_time: u64,
     ) -> Self {
         Self {
@@ -1063,10 +1066,10 @@ impl<'a, R: Read> CoreCoinReader<'a, R> {
             } else {
                 let parent = self
                     .headers
-                    .active_header_at(height - 1)
+                    .active_header(height - 1)?
                     .ok_or(CoreSnapshotError::Invalid("missing creation header"))?;
                 self.headers
-                    .median_time_past(parent.hash)
+                    .median_time_past(parent.hash)?
                     .ok_or(CoreSnapshotError::Invalid("missing creation MTP"))?
             };
             let key = OutPointKey::from(OutPoint::new(txid, vout));
@@ -1393,6 +1396,9 @@ fn write_compact_size_hash(engine: &mut sha256::HashEngine, value: u64) {
 }
 
 #[cfg(test)]
+use crate::headers::HeaderDag;
+
+#[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
@@ -1620,6 +1626,40 @@ mod tests {
         };
         assert_eq!(verified.metadata(), metadata);
         assert_eq!(verified.anchor(), anchor);
+    }
+
+    #[test]
+    fn unavailable_headers_remain_local_errors_in_anchor_and_coin_reads() {
+        let headers = crate::test_support::UnavailableHeaders(HeaderDag::new(Network::Bitcoin));
+        let anchor = core31_assumeutxo_anchors(Network::Bitcoin)[0];
+        let metadata = CoreSnapshotMetadata {
+            network: Network::Bitcoin,
+            base_block_hash: anchor.block_hash.parse().unwrap(),
+            coins_count: 1,
+        };
+        assert!(matches!(
+            validate_anchor(&headers, metadata, anchor),
+            Err(CoreSnapshotError::HeaderRead(HeaderReadError::Unavailable(
+                _
+            )))
+        ));
+        let coin = vec![2, 0, 6]; // height one, zero value, empty script
+        assert!(matches!(
+            read_indexed_coin(&mut Cursor::new(coin.clone()), 1, &headers, 0),
+            Err(CoreSnapshotError::HeaderRead(HeaderReadError::Unavailable(
+                _
+            )))
+        ));
+        let mut grouped = vec![1; 32];
+        grouped.extend_from_slice(&[1, 0]); // one coin, output zero
+        grouped.extend_from_slice(&coin);
+        let mut reader = CoreCoinReader::new(Cursor::new(grouped), 1, 1, &headers, 0);
+        assert!(matches!(
+            reader.next_coin(),
+            Err(CoreSnapshotError::HeaderRead(HeaderReadError::Unavailable(
+                _
+            )))
+        ));
     }
 
     #[test]

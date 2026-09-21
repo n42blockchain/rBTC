@@ -277,7 +277,7 @@ impl RedbPeerStore {
         let genesis = bitcoin::blockdata::constants::genesis_block(network)
             .block_hash()
             .to_byte_array();
-        let db = Database::create(path)?;
+        let db = crate::node_memory::create_redb(path)?;
         let transaction = db.begin_write()?;
         let bucket_key = {
             let mut meta = transaction.open_table(META)?;

@@ -105,7 +105,9 @@ async fn serve_one_block_regtest_node(
     listener: TcpListener,
     block: bitcoin::Block,
     release: oneshot::Receiver<()>,
+    accept_delay: Duration,
 ) {
+    tokio::time::sleep(accept_delay).await;
     let (stream, _) = listener.accept().await.unwrap();
     let mut peer = V1Transport::new(stream, Network::Regtest.magic());
     assert!(matches!(
@@ -146,7 +148,19 @@ async fn serve_one_block_regtest_node(
     let mut released = false;
     let mut release = Some(release);
     loop {
-        match peer.read_message().await.unwrap().into_payload() {
+        let message = match peer.read_message().await {
+            Ok(message) => message.into_payload(),
+            Err(rbtc::p2p::P2pError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("one-block peer read failed: {error}"),
+        };
+        match message {
             NetworkMessage::GetHeaders(_) => {
                 if released {
                     peer.write_message(NetworkMessage::Headers(Vec::new()))
@@ -317,6 +331,7 @@ fn external_host_can_validate_and_retain_the_complete_typed_config() {
         bulk_validation_bytes: 1024 * 1024 * 1024,
     };
     config.resources = NodeResourceConfig {
+        memory_budget_bytes: rbtc::node_memory::DEFAULT_MEMORY_BUDGET_BYTES,
         automatic_hot_standbys: 4,
         mempool_max_transactions: 4_096,
         mempool_max_bytes: 300 * 1024 * 1024,
@@ -603,6 +618,17 @@ async fn host_configured_zmq_endpoint_accepts_a_subscriber() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_zmq_endpoint_publishes_an_executed_block() {
+    exercise_zmq_block_publication(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_zmq_delivery_deadline_excludes_peer_startup() {
+    // Longer than the five-second frame deadline, shorter than the separate
+    // startup guard. This reproduced a frame timeout before the ordering fix.
+    exercise_zmq_block_publication(Duration::from_secs(6)).await;
+}
+
+async fn exercise_zmq_block_publication(accept_delay: Duration) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let remote = listener.local_addr().unwrap();
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest);
@@ -614,7 +640,12 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
         ))
         .expect("regtest block assembles");
     let (release, gate) = oneshot::channel();
-    let peer = tokio::spawn(serve_one_block_regtest_node(listener, block.clone(), gate));
+    let peer = tokio::spawn(serve_one_block_regtest_node(
+        listener,
+        block.clone(),
+        gate,
+        accept_delay,
+    ));
     let zmq_address: SocketAddr = {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         probe.local_addr().unwrap()
@@ -630,6 +661,27 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     let mut subscriber = zmtp_subscribe(zmq_address, &[b""]).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     release.send(()).unwrap();
+
+    // Startup, peer negotiation and execution have their own deadline. Frame
+    // delivery is checked only after the block has actually been executed.
+    let mut status = controller.subscribe_status();
+    timeout(NODE_STARTUP_TIMEOUT, async {
+        loop {
+            if status
+                .borrow_and_update()
+                .execution
+                .is_some_and(|tip| tip.height == 1)
+            {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap_or_else(|error| panic!(
+        "execution must reach the published block: {error}; status={:?}, lifecycle={:?}, peer_finished={}",
+        controller.status(), controller.lifecycle(), peer.is_finished(),
+    ));
 
     let (topic, body, sequence) = read_zmq_notification(&mut subscriber).await;
     assert_eq!(topic, b"hashblock");
@@ -651,26 +703,13 @@ async fn host_zmq_endpoint_publishes_an_executed_block() {
     );
     assert_eq!(body[32], b'C');
 
-    let mut status = controller.subscribe_status();
-    timeout(NODE_STARTUP_TIMEOUT, async {
-        loop {
-            if status
-                .borrow_and_update()
-                .execution
-                .is_some_and(|tip| tip.height == 1)
-            {
-                break;
-            }
-            status.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("execution must reach the published block");
-
     controller.request_shutdown();
     timeout(Duration::from_secs(3), handle.wait())
         .await
         .expect("node with a ZMQ endpoint must stop cleanly")
         .unwrap();
-    peer.abort();
+    timeout(Duration::from_secs(3), peer)
+        .await
+        .expect("the block peer must observe shutdown")
+        .expect("the block peer must finish without a detached panic");
 }

@@ -1,0 +1,13 @@
+# Streaming bounded archive batches
+
+Investigation of memory-pressure retry found that retained-ledger `read_block_batch` bounded only its returned records: it first loaded the compressed archive, decompressed the complete record stream and copied all blocks before selecting a batch. Reducing a requested batch therefore did not reduce those whole-archive allocations.
+
+The production ledger batch reader now uses `read_archive_batch`. It verifies compressed pieces, then streams every framed record and its full authenticated digest while retaining only a contiguous count/record-byte-bounded selection. Skipped records use 64 KiB heap scratch. An oversized first requested record cannot be skipped to select a later smaller block; the ledger preserves its prior byte-budget error. Cross-archive batches retain height order and remaining byte/count limits.
+
+The new reader opens one file and uses that handle for manifest, piece and record passes. Existing manifest/piece functions delegate to handle-based helpers. This avoids path replacement between its verification passes; final record hashing still verifies the decompressed contents. The existing compressed-piece buffer, manifest bound and zstd window ceiling remain and are not a total RSS/shared-budget claim. Full archive verification work is still required even for a small selection.
+
+Regression coverage includes selecting around a large skipped record, exact byte boundaries, unavailable starts, contiguous-prefix behavior, cross-archive reads and rejection of a bad full-record digest even when only the first block is requested. Legacy whole-archive reads remain unchanged.
+
+Node memory-pressure downshift/retry is not yet implemented. A staged segment is intentionally hidden from retained-ledger reads, and `stage` rejects an existing staged file. Safe recovery must use a bounded staged reader, confirm unchanged execution tip, preserve staged durability and revalidate blocks before publication; it must not route an unpublished segment through the ordinary replay reader or blindly retry staging. Startup whole-archive readers, archive staging/publication copies, shared memory ownership, fair work admission and full-scale/long-duration acceptance remain open.
+
+Prior CI35207232399/8063824 completed successfully on Linux (including 90% coverage), Windows and supply-chain. Local validation: all-feature library suite 1,046 passed, 0 failed, 12 ignored (71.64 s). After moving fixed scratch from stack to heap, final archive-focused tests: 14 passed, 0 failed (0.26 s). Strict all-target/all-feature Clippy passed (25.61 s); formatting and diff checks passed.

@@ -16,7 +16,13 @@ use thiserror::Error;
 
 use crate::deployments::DeploymentConfig;
 
+mod candidate;
+pub(crate) use candidate::CandidateContext;
+mod resources;
+mod view;
+pub use view::{HeaderReadError, HeaderSnapshot, HeaderView};
 mod retention;
+pub use resources::{HeaderBatchLimits, HeaderWorkBudget};
 pub use retention::{HeaderRetentionError, StagedHeaderEviction};
 
 /// Bitcoin Core's maximum permitted future block timestamp offset.
@@ -24,13 +30,17 @@ pub const MAX_FUTURE_BLOCK_TIME_SECS: u32 = 2 * 60 * 60;
 /// BIP94 maximum backward timestamp movement at a Testnet4 retarget boundary.
 pub const MAX_TIMEWARP_SECS: u32 = 10 * 60;
 
+/// Emergency retained-entry ceiling, excluding genesis. This bounds DAG entry
+/// count, not whole-process RSS, and does not replace a disk-backed recovery path.
+pub const DEFAULT_MAX_RETAINED_HEADERS: usize = 2_000_000;
+
 /// Consensus parameters corrected where rust-bitcoin differs from Core.
 ///
 /// rust-bitcoin reuses mainnet's two-week target timespan for regtest, while
 /// Core uses one day. Regtest still disables retargeting and leaves BIP94 off
 /// by default; the 144-block interval is nevertheless consensus-observable to
 /// callers and must match Core.
-fn core_params(network: Network) -> Params {
+pub(crate) fn core_params(network: Network) -> Params {
     let mut params = Params::new(network);
     if network == Network::Regtest {
         params.pow_target_timespan = 24 * 60 * 60;
@@ -54,6 +64,31 @@ pub struct HeaderInfo {
 /// Rejection reason for a header DAG insertion.
 #[derive(Debug, Error)]
 pub enum HeaderError {
+    /// A local validated-header source could not be read.
+    #[error("header lookup: {0}")]
+    Read(#[from] HeaderReadError),
+    /// A local staging-byte or validation-work allowance was exhausted.
+    #[error("header resource deferred: {resource} requires {required}, remaining {remaining}")]
+    BudgetDeferred {
+        /// Accounting domain; never a consensus rejection.
+        resource: &'static str,
+        /// Units needed before starting the operation.
+        required: u64,
+        /// Units available to this operation.
+        remaining: u64,
+    },
+    /// A local capacity limit was reached before staging allocations or writes.
+    #[error(
+        "header resource deferred: {retained} retained + {requested} requested exceeds {limit}"
+    )]
+    ResourceDeferred {
+        /// Existing non-genesis entries.
+        retained: usize,
+        /// Requested batch size.
+        requested: usize,
+        /// Non-genesis entry ceiling.
+        limit: usize,
+    },
     /// The header is already present in this DAG.
     #[error("duplicate header {0}")]
     Duplicate(BlockHash),
@@ -162,7 +197,7 @@ pub struct HeaderDag {
     deployments: DeploymentConfig,
     headers: HashMap<BlockHash, HeaderInfo>,
     // Built once on the first explicit retention operation. Serving projections
-    // do not need this index, and automatic retention is not enabled yet.
+    // do not need this index. Idle maintenance initializes it on first eviction.
     child_counts: Option<HashMap<BlockHash, usize>>,
     active_tip: BlockHash,
     active_chain: Vec<BlockHash>,
@@ -184,6 +219,10 @@ pub struct StagedHeaderBatch<'a> {
 }
 
 impl StagedHeaderBatch<'_> {
+    pub(crate) fn active_tip(&self) -> HeaderInfo {
+        self.dag.active_tip()
+    }
+
     /// Makes the staged headers visible permanently and returns their metadata.
     #[must_use]
     pub fn commit(mut self) -> Vec<HeaderInfo> {
@@ -255,8 +294,22 @@ impl HeaderDag {
         self.params.network
     }
 
-    pub(crate) fn uses_deployments(&self, deployments: &DeploymentConfig) -> bool {
-        &self.deployments == deployments
+    #[cfg(test)]
+    pub(crate) fn test_replay_headers(&self) -> Vec<Header> {
+        let mut records = self
+            .headers
+            .values()
+            .filter(|info| info.height != 0)
+            .copied()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|info| {
+            (
+                info.height,
+                self.active_height_of(info.hash).is_none(),
+                info.hash,
+            )
+        });
+        records.into_iter().map(|info| info.header).collect()
     }
 
     /// Returns the highest cumulative-work header.
@@ -373,6 +426,33 @@ impl HeaderDag {
         locator
     }
 
+    /// Builds a locator starting at a retained fork tip. Ancestors remain on
+    /// that fork until it joins the active chain; no chain selection is changed.
+    /// Returns None when the requested tip or its ancestry is unavailable.
+    #[must_use]
+    pub fn block_locator_from(&self, tip: BlockHash) -> Option<Vec<BlockHash>> {
+        let mut current = self.get(&tip)?;
+        let mut locator = Vec::new();
+        let mut step = 1_u32;
+        loop {
+            locator.push(current.hash);
+            if current.height == 0 {
+                return Some(locator);
+            }
+            let target = current.height.saturating_sub(step);
+            while current.height > target {
+                if self.active_height_of(current.hash).is_some() {
+                    current = self.active_header_at(target)?;
+                    break;
+                }
+                current = self.get(&current.header.prev_blockhash)?;
+            }
+            if locator.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+    }
+
     /// Contextually validates and stages a contiguous header batch in place.
     ///
     /// The returned guard rolls the batch back unless the caller commits it,
@@ -386,6 +466,52 @@ impl HeaderDag {
         headers: &[Header],
         adjusted_time: u32,
     ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        self.stage_batch_contextual_with_limit(headers, adjusted_time, DEFAULT_MAX_RETAINED_HEADERS)
+    }
+
+    /// Reserves the batch's entry capacity before allocating staging vectors.
+    /// Exclusive DAG ownership holds that capacity until commit or rollback.
+    /// Capacity exhaustion is local deferral, never consensus invalidity.
+    pub fn stage_batch_contextual_with_limit(
+        &mut self,
+        headers: &[Header],
+        adjusted_time: u32,
+        max_headers: usize,
+    ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        self.stage_batch_contextual_with_budget(
+            headers,
+            adjusted_time,
+            HeaderBatchLimits {
+                max_headers,
+                ..HeaderBatchLimits::default()
+            },
+            &mut HeaderWorkBudget::default(),
+        )
+    }
+
+    /// Stages within explicit metadata-byte, retained-entry and work allowances.
+    /// Reusing `work` across calls also bounds failed attempts; work is never refunded.
+    /// The byte limit covers the two staging vectors, not the DAG or process RSS.
+    pub fn stage_batch_contextual_with_budget(
+        &mut self,
+        headers: &[Header],
+        adjusted_time: u32,
+        limits: HeaderBatchLimits,
+        work: &mut HeaderWorkBudget,
+    ) -> Result<StagedHeaderBatch<'_>, HeaderError> {
+        limits.check_staging_bytes(headers.len())?;
+        let max_headers = limits.max_headers;
+        let retained = self.headers.len().saturating_sub(1);
+        if retained
+            .checked_add(headers.len())
+            .is_none_or(|total| total > max_headers)
+        {
+            return Err(HeaderError::ResourceDeferred {
+                retained,
+                requested: headers.len(),
+                limit: max_headers,
+            });
+        }
         let original_active_tip = self.active_tip;
         let original_active_len = self.active_chain.len();
         let mut staged = StagedHeaderBatch {
@@ -398,6 +524,7 @@ impl HeaderDag {
             committed: false,
         };
         for header in headers {
+            staged.dag.reserve_validation_work(header, work)?;
             let rebuilds_active_chain = staged.dag.insertion_rebuilds_active_chain(header);
             let info = staged.dag.insert_contextual(*header, adjusted_time)?;
             staged.rebuilt_active_chain |= rebuilds_active_chain;
@@ -511,6 +638,25 @@ impl HeaderDag {
         header: Header,
         adjusted_time: u32,
     ) -> Result<HeaderInfo, HeaderError> {
+        let info = self.validate_contextual(header, adjusted_time)?;
+        self.publish_header(info);
+        Ok(info)
+    }
+
+    fn validate_contextual(
+        &self,
+        header: Header,
+        adjusted_time: u32,
+    ) -> Result<HeaderInfo, HeaderError> {
+        self.validate_contextual_replayed(header, adjusted_time, None)
+    }
+
+    fn validate_contextual_replayed(
+        &self,
+        header: Header,
+        adjusted_time: u32,
+        known: Option<HeaderInfo>,
+    ) -> Result<HeaderInfo, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Err(HeaderError::Duplicate(hash));
@@ -525,7 +671,7 @@ impl HeaderDag {
             .checked_add(1)
             .ok_or(HeaderError::HeightOverflow)?;
         if let Some(checkpoint_height) = self.last_known_checkpoint_height() {
-            if height < checkpoint_height {
+            if height < checkpoint_height && known.is_none() {
                 return Err(HeaderError::ForkBeforeCheckpoint {
                     height,
                     checkpoint_height,
@@ -565,7 +711,14 @@ impl HeaderDag {
                 actual: header.bits.to_consensus(),
             });
         }
-        self.insert(header)
+        let info = self.validate_structure(header)?;
+        if known.is_some_and(|known| known != info) {
+            return Err(HeaderReadError::Inconsistent(
+                "replayed header differs from validated source",
+            )
+            .into());
+        }
+        Ok(info)
     }
 
     /// Adds a proof-of-work-valid child and promotes it if it has more chainwork.
@@ -575,6 +728,12 @@ impl HeaderDag {
     /// Returns an error for duplicates, missing parents, invalid targets, invalid
     /// proof of work, or unrepresentable heights.
     pub fn insert(&mut self, header: Header) -> Result<HeaderInfo, HeaderError> {
+        let info = self.validate_structure(header)?;
+        self.publish_header(info);
+        Ok(info)
+    }
+
+    fn validate_structure(&self, header: Header) -> Result<HeaderInfo, HeaderError> {
         let hash = header.block_hash();
         if self.headers.contains_key(&hash) {
             return Err(HeaderError::Duplicate(hash));
@@ -610,11 +769,14 @@ impl HeaderDag {
             height,
             chainwork: parent.chainwork + target.to_work(),
         };
+        Ok(info)
+    }
+
+    fn publish_header(&mut self, info: HeaderInfo) {
         self.restore_retained_header(info);
         if info.chainwork > self.active_tip().chainwork {
             self.promote_active_tip(info);
         }
-        Ok(info)
     }
 
     fn promote_active_tip(&mut self, info: HeaderInfo) {
@@ -658,7 +820,11 @@ impl HeaderDag {
         let Some(height) = parent.height.checked_add(1) else {
             return false;
         };
-        let chainwork = parent.chainwork + header.target().to_work();
+        let target = header.target();
+        if target == bitcoin::pow::Target::ZERO || target > self.params.max_attainable_target {
+            return false;
+        }
+        let chainwork = parent.chainwork + target.to_work();
         chainwork > self.active_tip().chainwork
             && !(parent.hash == self.active_tip
                 && usize::try_from(height).ok() == Some(self.active_chain.len()))
@@ -801,7 +967,7 @@ mod tests {
         assert!(!HeaderError::UnknownParent(BlockHash::all_zeros()).is_peer_invalid());
     }
 
-    fn mine_child(parent: BlockHash, time: u32) -> Header {
+    pub(super) fn mine_child(parent: BlockHash, time: u32) -> Header {
         let target = Params::new(Network::Regtest).max_attainable_target;
         let mut header = Header {
             version: Version::from_consensus(4),

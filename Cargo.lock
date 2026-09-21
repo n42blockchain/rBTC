@@ -1167,6 +1167,7 @@ dependencies = [
  "mimalloc",
  "proptest",
  "rand 0.10.2",
+ "rbtc-codec-memory",
  "redb",
  "rusqlite",
  "serde",
@@ -1179,6 +1180,14 @@ dependencies = [
  "tokio-stream",
  "tower",
  "zstd",
+]
+
+[[package]]
+name = "rbtc-codec-memory"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "zstd-sys",
 ]
 
 [[package]]
@@ -1795,8 +1804,6 @@ dependencies = [
 [[package]]
 name = "zstd-sys"
 version = "2.1.0+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ef0a8027ec3ee71300ab3bcbcd0393f434aa72b91ca6d635a39941deae8eea0"
 dependencies = [
  "cc",
  "pkg-config",

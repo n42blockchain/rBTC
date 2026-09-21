@@ -280,7 +280,7 @@ impl RedbTransactionPoolStore {
         .validate()?;
         let path = path.as_ref();
         validate_file_before_open(path)?;
-        let db = Database::create(path)?;
+        let db = crate::node_memory::create_redb(path)?;
         restrict_file_permissions(path)?;
         let genesis = genesis_hash(network);
         let write = db.begin_write()?;

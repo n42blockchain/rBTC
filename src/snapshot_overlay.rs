@@ -46,9 +46,10 @@ use bitcoin::{
     hashes::{Hash as _, sha256d},
 };
 use libmdbx::{
-    Database, DatabaseOptions, Mode, NoWriteMap, RW, ReadWriteOptions, SyncMode, Table, TableFlags,
-    Transaction, TransactionKind, WriteFlags,
+    Database, NoWriteMap, RW, Table, TableFlags, Transaction, TransactionKind, WriteFlags,
 };
+#[cfg(test)]
+use libmdbx::{DatabaseOptions, Mode, ReadWriteOptions, SyncMode};
 use thiserror::Error;
 
 use crate::{
@@ -59,10 +60,10 @@ use crate::{
     },
     core_snapshot_index::{
         CoreSnapshotIndexError, CoreSnapshotUtxoIndex, SnapshotBaseIdentity,
-        build_core_snapshot_index_with_identity,
+        build_with_identity_and_memory,
     },
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     undo_store::{decode_block_undo, encode_block_undo},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -159,7 +160,8 @@ pub struct SnapshotOverlayConfig {
 pub struct SnapshotOverlayChainstate {
     /// `None` while the environment is being replaced, or after a fatal
     /// reopen error. A failed reopen requires discarding and reopening the store.
-    db: Option<Database<NoWriteMap>>,
+    db: Option<crate::mdbx_memory::Environment>,
+    environment_allowance: crate::mdbx_memory::Allowance,
     database_dir: PathBuf,
     base: CoreSnapshotUtxoIndex,
     identity: SnapshotBaseIdentity,
@@ -170,6 +172,7 @@ pub struct SnapshotOverlayChainstate {
     snapshot_path: PathBuf,
     index_path: PathBuf,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
 impl SnapshotOverlayChainstate {
@@ -187,7 +190,12 @@ impl SnapshotOverlayChainstate {
         config: SnapshotOverlayConfig,
         identity: Option<&SnapshotBaseIdentity>,
     ) -> Result<Self, SnapshotOverlayError> {
-        let base = CoreSnapshotUtxoIndex::open(&config.index_path, &config.snapshot_path)?;
+        let memory = crate::node_memory::for_path(&config.database_dir)?;
+        let base = CoreSnapshotUtxoIndex::open_with_memory(
+            &config.index_path,
+            &config.snapshot_path,
+            memory.as_ref(),
+        )?;
         let db = open_environment(&config.database_dir, config.capacity_bytes)?;
         let identity = {
             let transaction = db.begin_rw_txn()?;
@@ -256,7 +264,11 @@ impl SnapshotOverlayChainstate {
                 "creation-MTP table must cover exactly heights 0..=base",
             ));
         }
+        let execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(&config.database_dir)?;
         Ok(Self {
+            execution_spool,
+            environment_allowance: db.allowance(),
             db: Some(db),
             database_dir: config.database_dir,
             base,
@@ -688,11 +700,12 @@ impl SnapshotOverlayChainstate {
         new_index_path: impl AsRef<Path>,
         mtp_extension: &[u32],
     ) -> Result<RebaseReport, SnapshotOverlayError> {
+        let allowance = self.environment_allowance.clone();
         self.rebase_with_reopen(
             new_snapshot_path.as_ref(),
             new_index_path.as_ref(),
             mtp_extension,
-            open_environment,
+            |path, capacity| open_environment_reserved(path, capacity, allowance),
         )
     }
 
@@ -704,9 +717,10 @@ impl SnapshotOverlayChainstate {
         new_snapshot_path: &Path,
         new_index_path: &Path,
         mtp_extension: &[u32],
-        reopen: impl FnOnce(&Path, u64) -> Result<Database<NoWriteMap>, SnapshotOverlayError>,
+        reopen: impl FnOnce(&Path, u64) -> Result<crate::mdbx_memory::Environment, SnapshotOverlayError>,
     ) -> Result<RebaseReport, SnapshotOverlayError> {
-        if new_snapshot_path.exists() || new_index_path.exists() {
+        let fingerprint_path = crate::core_snapshot_index::fingerprint_sidecar_path(new_index_path);
+        if new_snapshot_path.exists() || new_index_path.exists() || fingerprint_path.exists() {
             return Err(SnapshotOverlayError::Invalid(
                 "rebase output paths already exist",
             ));
@@ -874,10 +888,22 @@ impl SnapshotOverlayChainstate {
         };
         // The index build re-decodes the complete file and re-derives the
         // commitment, so a compression asymmetry cannot survive publication.
-        let report =
-            build_core_snapshot_index_with_identity(new_snapshot_path, new_index_path, &identity)?;
+        // The builder publishes the index and then its optional fingerprint
+        // sidecar. Own both paths before either publication can fail.
         cleanup.track(new_index_path.to_owned());
-        let new_base = CoreSnapshotUtxoIndex::open(new_index_path, new_snapshot_path)?;
+        cleanup.track(fingerprint_path);
+        let memory = crate::node_memory::for_path(&self.database_dir)?;
+        let report = build_with_identity_and_memory(
+            new_snapshot_path,
+            new_index_path,
+            &identity,
+            memory.as_ref(),
+        )?;
+        let new_base = CoreSnapshotUtxoIndex::open_with_memory(
+            new_index_path,
+            new_snapshot_path,
+            memory.as_ref(),
+        )?;
 
         // `clear_table` alone is not enough: MDBX's copy-on-write B-tree
         // reclaims freed pages onto a freelist for reuse, but `last_pgno` —
@@ -908,7 +934,11 @@ impl SnapshotOverlayChainstate {
             fs::remove_dir_all(&fresh_dir)?;
         }
         {
-            let fresh_db = open_environment(&fresh_dir, self.capacity_bytes)?;
+            let fresh_db = open_environment_with_memory(
+                &fresh_dir,
+                self.capacity_bytes,
+                self.db.as_ref().expect("active environment").memory(),
+            )?;
             let transaction = fresh_db.begin_rw_txn()?;
             for name in [OVERLAY, TOMBSTONE, UNDO, META] {
                 transaction.create_table(Some(name), TableFlags::empty())?;
@@ -959,7 +989,11 @@ impl SnapshotOverlayChainstate {
             // Nothing has moved yet; the old environment is exactly as it
             // was. Reopening it restores a usable store before reporting
             // the failure.
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(open_environment_reserved(
+                &self.database_dir,
+                self.capacity_bytes,
+                self.environment_allowance.clone(),
+            )?);
             return Err(error.into());
         }
         match fs::rename(&fresh_dir, &self.database_dir) {
@@ -974,7 +1008,11 @@ impl SnapshotOverlayChainstate {
                 // canonical name so the store's on-disk state matches what
                 // this call is about to report as its outcome.
                 fs::rename(&trash_dir, &self.database_dir)?;
-                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                self.db = Some(open_environment_reserved(
+                    &self.database_dir,
+                    self.capacity_bytes,
+                    self.environment_allowance.clone(),
+                )?);
                 return Err(error.into());
             }
         }
@@ -1063,7 +1101,11 @@ impl SnapshotOverlayChainstate {
             name
         });
         if let Err(error) = fs::rename(&self.database_dir, &trash_dir) {
-            self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+            self.db = Some(open_environment_reserved(
+                &self.database_dir,
+                self.capacity_bytes,
+                self.environment_allowance.clone(),
+            )?);
             return Err(error.into());
         }
         match fs::rename(&fresh_dir, &self.database_dir) {
@@ -1072,11 +1114,19 @@ impl SnapshotOverlayChainstate {
             }
             Err(error) => {
                 fs::rename(&trash_dir, &self.database_dir)?;
-                self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+                self.db = Some(open_environment_reserved(
+                    &self.database_dir,
+                    self.capacity_bytes,
+                    self.environment_allowance.clone(),
+                )?);
                 return Err(error.into());
             }
         }
-        self.db = Some(open_environment(&self.database_dir, self.capacity_bytes)?);
+        self.db = Some(open_environment_reserved(
+            &self.database_dir,
+            self.capacity_bytes,
+            self.environment_allowance.clone(),
+        )?);
         cleanup.disarm();
         Ok(crate::snapshot_overlay_redb::CompactionReport {
             reclaimed: true,
@@ -1616,10 +1666,17 @@ impl<'txn, K: TransactionKind> OverlayGroupReader<'txn, K> {
 
 impl UtxoStore for SnapshotOverlayChainstate {
     fn get(&self, outpoint: OutPointKey) -> Result<Option<Utxo>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
-        if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
-            return Utxo::decode(&value).map(Some);
+        if let Some(value) =
+            transaction.get::<std::borrow::Cow<'_, [u8]>>(&overlay, outpoint.as_bytes())?
+        {
+            return Utxo::decode_with_script_limit(&value, limit).map(Some);
         }
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
         if transaction
@@ -1636,6 +1693,11 @@ impl UtxoStore for SnapshotOverlayChainstate {
         &self,
         outpoints: &[OutPointKey],
     ) -> Result<Vec<(OutPointKey, Option<Utxo>)>, UtxoError> {
+        let limit = if self.execution_spool.is_some() {
+            crate::chainstate::MAX_SCRIPT_SIZE
+        } else {
+            usize::MAX
+        };
         let transaction = self.db().begin_ro_txn()?;
         let overlay = transaction.open_table(Some(OVERLAY))?;
         let tombstone = transaction.open_table(Some(TOMBSTONE))?;
@@ -1646,8 +1708,13 @@ impl UtxoStore for SnapshotOverlayChainstate {
         let mut base_wanted: Vec<OutPoint> = Vec::new();
         let mut base_positions: Vec<usize> = Vec::new();
         for outpoint in outpoints {
-            if let Some(value) = transaction.get::<Vec<u8>>(&overlay, outpoint.as_bytes())? {
-                results.push((*outpoint, Some(Utxo::decode(&value)?)));
+            if let Some(value) =
+                transaction.get::<std::borrow::Cow<'_, [u8]>>(&overlay, outpoint.as_bytes())?
+            {
+                results.push((
+                    *outpoint,
+                    Some(Utxo::decode_with_script_limit(&value, limit)?),
+                ));
             } else if transaction
                 .get::<()>(&tombstone, outpoint.as_bytes())?
                 .is_some()
@@ -1752,6 +1819,10 @@ impl UtxoStore for SnapshotOverlayChainstate {
 }
 
 impl ExecutionChainStore for SnapshotOverlayChainstate {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn take_commit_profile(&self) -> Option<[u64; 5]> {
         Some(self.commit_profile.take_millis())
     }
@@ -1785,7 +1856,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let _guard = self.lock();
@@ -1803,7 +1874,7 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
                 let hash = BlockHash::from_byte_array(key);
                 let header =
                     headers
-                        .get(&hash)
+                        .header(&hash)?
                         .ok_or(ChainStoreError::Utxo(UtxoError::Malformed(
                             "block undo references an unknown header",
                         )))?;
@@ -1885,6 +1956,17 @@ impl ExecutionChainStore for SnapshotOverlayChainstate {
         transaction.commit().map_err(utxo_mdbx)?;
         CommitProfile::add(&self.commit_profile.sync, sync_started);
         Ok(())
+    }
+
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<crate::chain_store::LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let collected = crate::chain_store::collect_transition_stream(transitions, final_tip)?;
+        self.commit_connect_batch(&collected.transitions)
     }
 
     fn commit_disconnect(
@@ -2152,22 +2234,40 @@ impl SnapshotOverlayChainstate {
 fn open_environment(
     database_dir: &Path,
     capacity_bytes: u64,
-) -> Result<Database<NoWriteMap>, SnapshotOverlayError> {
-    fs::create_dir_all(database_dir)?;
-    let capacity = isize::try_from(capacity_bytes)
-        .map_err(|_| SnapshotOverlayError::Invalid("capacity exceeds platform limits"))?;
-    Ok(Database::open_with_options(
+) -> Result<crate::mdbx_memory::Environment, SnapshotOverlayError> {
+    open_environment_with_memory(
         database_dir,
-        DatabaseOptions {
-            max_tables: Some(4),
-            mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
-                max_size: Some(capacity),
-                ..ReadWriteOptions::default()
-            }),
-            ..DatabaseOptions::default()
-        },
-    )?)
+        capacity_bytes,
+        crate::node_memory::for_path(database_dir)?,
+    )
+}
+
+fn open_environment_with_memory(
+    database_dir: &Path,
+    capacity_bytes: u64,
+    memory: Option<crate::node_memory::MemoryBudget>,
+) -> Result<crate::mdbx_memory::Environment, SnapshotOverlayError> {
+    crate::mdbx_memory::Environment::open(database_dir, capacity_bytes, memory).map_err(|error| {
+        match error {
+            UtxoError::Io(error) => SnapshotOverlayError::Io(error),
+            UtxoError::Mdbx(error) => SnapshotOverlayError::Mdbx(error),
+            error => SnapshotOverlayError::Utxo(error),
+        }
+    })
+}
+
+fn open_environment_reserved(
+    path: &Path,
+    capacity: u64,
+    allowance: crate::mdbx_memory::Allowance,
+) -> Result<crate::mdbx_memory::Environment, SnapshotOverlayError> {
+    crate::mdbx_memory::Environment::open_reserved(path, capacity, allowance).map_err(|error| {
+        match error {
+            UtxoError::Io(error) => SnapshotOverlayError::Io(error),
+            UtxoError::Mdbx(error) => SnapshotOverlayError::Mdbx(error),
+            error => SnapshotOverlayError::Utxo(error),
+        }
+    })
 }
 
 fn utxo_mdbx(error: libmdbx::Error) -> ChainStoreError {
@@ -2363,7 +2463,12 @@ pub(crate) mod tests {
         let snapshot_path = directory.join(format!("utxo-{base_height}.dat"));
         let index_path = directory.join(format!("utxo-{base_height}.rbtcidx"));
         fs::write(&snapshot_path, &bytes).unwrap();
-        build_core_snapshot_index_with_identity(&snapshot_path, &index_path, &identity).unwrap();
+        crate::core_snapshot_index::build_core_snapshot_index_with_identity(
+            &snapshot_path,
+            &index_path,
+            &identity,
+        )
+        .unwrap();
         (snapshot_path, index_path, identity)
     }
 

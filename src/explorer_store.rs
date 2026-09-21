@@ -86,7 +86,7 @@ impl RedbExplorerIndex {
     /// Opens or creates an explorer index for `network`.
     pub fn open(path: impl AsRef<Path>, network: Network) -> Result<Self, ExplorerStoreError> {
         let genesis = bitcoin::blockdata::constants::genesis_block(network).block_hash();
-        let db = Database::create(path)?;
+        let db = crate::node_memory::create_redb(path)?;
         let transaction = db.begin_write()?;
         {
             let mut meta = transaction.open_table(META)?;

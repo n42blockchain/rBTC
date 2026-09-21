@@ -1,5 +1,380 @@
 use super::*;
 
+#[derive(Debug, Default)]
+struct HeaderPeerProgress {
+    requests: std::sync::atomic::AtomicUsize,
+    pings: std::sync::atomic::AtomicUsize,
+}
+
+async fn next_header_request(
+    peer: &mut V1Transport<tokio::net::TcpStream>,
+    progress: &HeaderPeerProgress,
+) -> bitcoin::p2p::message_blockdata::GetHeadersMessage {
+    use std::sync::atomic::Ordering;
+    loop {
+        match peer.read_message().await.unwrap().into_payload() {
+            NetworkMessage::GetHeaders(request) => {
+                progress.requests.fetch_add(1, Ordering::Relaxed);
+                return request;
+            }
+            NetworkMessage::Ping(nonce) => {
+                progress.pings.fetch_add(1, Ordering::Relaxed);
+                peer.write_message(NetworkMessage::Pong(nonce))
+                    .await
+                    .unwrap();
+            }
+            other => panic!("expected GetHeaders or replay Ping, received {other:?}"),
+        }
+    }
+}
+
+async fn serve_replay_pings_until(
+    peer: &mut V1Transport<tokio::net::TcpStream>,
+    mut finished: tokio::sync::oneshot::Receiver<()>,
+    progress: &HeaderPeerProgress,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut finished => return,
+            message = peer.read_message() => {
+                match message.unwrap().into_payload() {
+                    NetworkMessage::Ping(nonce) => {
+                        progress.pings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        peer.write_message(NetworkMessage::Pong(nonce)).await.unwrap();
+                    }
+                    other => panic!("expected replay Ping after final headers, received {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn header_replay_keepalive_precedes_locator_without_breaking_peer_protocol() {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let progress = Arc::new(HeaderPeerProgress::default());
+    let peer_progress = Arc::clone(&progress);
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let (finish_peer, finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9733)).await;
+        let request = next_header_request(&mut peer, &peer_progress).await;
+        assert_eq!(request.locator_hashes, vec![genesis]);
+        peer.write_message(NetworkMessage::Headers(Vec::new()))
+            .await
+            .unwrap();
+        serve_replay_pings_until(&mut peer, finished, &peer_progress).await;
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9732,
+        "/rbtc:keepalive-test/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(5), keepalive.tick(Some(&mut peer)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 1);
+    assert_eq!(progress.requests.load(Ordering::Relaxed), 0);
+    keepalive.tick(Some(&mut peer)).await.unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 1);
+    request_headers(&mut peer, vec![genesis]).await.unwrap();
+    assert!(receive_headers(&mut peer).await.unwrap().is_empty());
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(5), keepalive.tick(Some(&mut peer)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.pings.load(Ordering::Relaxed), 2);
+    finish_peer.send(()).unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.requests.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn header_replay_polls_admission_while_finishing_keepalive() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let (grant, granted) = tokio::sync::oneshot::channel();
+    let (polled, admission_polled) = tokio::sync::oneshot::channel();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9735)).await;
+        let message = peer.read_message().await.unwrap().into_payload();
+        let NetworkMessage::Ping(nonce) = message else {
+            panic!("expected replay ping, got {message:?}");
+        };
+        grant.send(42).unwrap();
+        // Withhold Pong until admission advances. Polling only ping here
+        // would stall the FIFO head and this bounded handshake would fail.
+        timeout(Duration::from_secs(5), admission_polled)
+            .await
+            .unwrap()
+            .unwrap();
+        peer.write_message(NetworkMessage::Pong(nonce))
+            .await
+            .unwrap();
+        let request = next_header_request(&mut peer, &HeaderPeerProgress::default()).await;
+        assert_eq!(request.locator_hashes, vec![genesis]);
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9734,
+        "/rbtc:admission-keepalive/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    let admission = async move {
+        let value = granted.await.unwrap();
+        polled.send(()).unwrap();
+        value
+    };
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            keepalive.wait(Some(&mut peer), admission)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        42
+    );
+    // The granted work did not cancel the ping exchange or leave its Pong
+    // for a later request to consume as an unexpected protocol message.
+    request_headers(&mut peer, vec![genesis]).await.unwrap();
+    timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn header_replay_disconnect_drops_pending_admission() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9737)).await;
+        assert!(matches!(
+            peer.read_message().await.unwrap().into_payload(),
+            NetworkMessage::Ping(_)
+        ));
+        // Disconnect without Pong, while admission is still waiting.
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9736,
+        "/rbtc:admission-disconnect/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let (owned, released) = tokio::sync::oneshot::channel::<()>();
+    let admission = async move {
+        let _owned = owned;
+        std::future::pending::<()>().await;
+    };
+    let mut keepalive = crate::node::header_sync::ReplayKeepalive::new(
+        std::time::Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap(),
+    );
+    let error = timeout(
+        Duration::from_secs(5),
+        keepalive.wait(Some(&mut peer), admission),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(error.kind, PeerFailureKind::Transient);
+    assert!(
+        released.await.is_err(),
+        "pending admission retained its resources"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn header_recovery_continues_past_known_or_evicted_losing_prefix() {
+    for (evict, interrupted) in [(false, false), (true, false), (false, true), (true, true)] {
+        let peer_progress = Arc::new(HeaderPeerProgress::default());
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("headers.redb");
+        let deployments = DeploymentConfig::for_network(Network::Regtest);
+        let mut dag = HeaderDag::with_deployments(deployments.clone());
+        let genesis = dag.active_tip();
+        let mut parent = genesis.header;
+        let mut active = Vec::new();
+        for _ in 0..2001 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+            active.push(parent);
+        }
+        let mut fork = Vec::new();
+        parent = genesis.header;
+        for _ in 0..2002 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+            fork.push(parent);
+        }
+        let now = unix_time().unwrap();
+        let _ = dag.stage_batch_contextual(&active, now).unwrap().commit();
+        let _ = dag
+            .stage_batch_contextual(&fork[..2000], now)
+            .unwrap()
+            .commit();
+        let store = RedbHeaderStore::open(&path).unwrap();
+        store.append_batch(&active).unwrap();
+        store.append_batch(&fork[..2000]).unwrap();
+        drop(store);
+        let mut dag = NodeHeaderState::test_seed(dag, &path);
+        if evict {
+            assert_eq!(dag.retain_idle(genesis.hash, 0, 2000).unwrap(), 0);
+            let executed = dag.active_tip().hash;
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 1000);
+            assert!(dag.header(&fork[999].block_hash()).unwrap().is_some());
+            assert!(dag.header(&fork[1000].block_hash()).unwrap().is_none());
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 1000);
+            assert_eq!(dag.retain_idle(executed, 0, 1000).unwrap(), 0);
+        }
+        let expected = fork[2001].block_hash();
+        let cursor = fork[1999].block_hash();
+        if interrupted {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let remote = listener.local_addr().unwrap();
+            let prefix = fork[..2000].to_vec();
+            let server_progress = Arc::clone(&peer_progress);
+            let server = tokio::spawn(async move {
+                let (mut peer, _) = accept_peer(listener, peer_version(9561)).await;
+                let _ = next_header_request(&mut peer, &server_progress).await;
+                peer.write_message(NetworkMessage::Headers(prefix))
+                    .await
+                    .unwrap();
+                let request = next_header_request(&mut peer, &server_progress).await;
+                assert_eq!(request.locator_hashes[0], cursor);
+                // Disconnect after the committed prefix, before the winning suffix.
+            });
+            let mut session = connect_outbound(
+                remote,
+                Network::Regtest.magic(),
+                9560,
+                "/rbtc:interrupted-recovery/".to_owned(),
+                0,
+            )
+            .await
+            .unwrap();
+            assert!(
+                timeout(
+                    Duration::from_secs(20),
+                    sync_headers(
+                        &mut session,
+                        &deployments,
+                        path.clone(),
+                        &NetworkTime::default(),
+                        None,
+                    )
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            timeout(Duration::from_secs(20), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let store = RedbHeaderStore::open(&path).unwrap();
+            assert_eq!(store.recovery_tip().unwrap(), Some(cursor));
+            assert_eq!(store.len().unwrap(), 4001);
+            assert_eq!(
+                store.load_dag(Network::Regtest, now).unwrap().active_tip(),
+                dag.active_tip()
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let (finish_peer, finished) = tokio::sync::oneshot::channel();
+        let server_progress = Arc::clone(&peer_progress);
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(9551)).await;
+            let mut request = next_header_request(&mut peer, &server_progress).await;
+            if !interrupted {
+                peer.write_message(NetworkMessage::Headers(fork[..2000].to_vec()))
+                    .await
+                    .unwrap();
+                let next = next_header_request(&mut peer, &server_progress).await;
+                request = next;
+            }
+            assert_eq!(request.locator_hashes[0], cursor);
+            assert_eq!(request.locator_hashes.last(), Some(&genesis.hash));
+            peer.write_message(NetworkMessage::Headers(fork[2000..].to_vec()))
+                .await
+                .unwrap();
+            serve_replay_pings_until(&mut peer, finished, &server_progress).await;
+        });
+        let mut session = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            9550,
+            "/rbtc:recovery-test/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let recovered = timeout(
+            Duration::from_secs(20),
+            sync_headers(
+                &mut session,
+                &deployments,
+                path.clone(),
+                &NetworkTime::default(),
+                None,
+            ),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("header recovery timeout: evict={evict} interrupted={interrupted} peer={peer_progress:?}: {error}"))
+        .unwrap();
+        finish_peer.send(()).unwrap();
+        assert_eq!(recovered.active_tip().hash, expected);
+        assert_eq!(
+            recovered.branch_locator(expected).unwrap(),
+            Some(recovered.block_locator().unwrap())
+        );
+        let store = RedbHeaderStore::open(&path).unwrap();
+        assert_eq!(store.recovery_tip().unwrap(), None);
+        let reopened = store.load_dag(Network::Regtest, now).unwrap();
+        assert_eq!(reopened.active_tip(), recovered.active_tip());
+        timeout(Duration::from_secs(20), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn block_window_fallback_preserves_order_and_only_refetches_missing_slots() {
@@ -171,7 +546,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let mut dag = sync_headers(
+    let mut dag = sync_headers_bounded(
         &mut session,
         &deployments,
         path.clone(),
@@ -187,7 +562,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
     );
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
     for _ in 0..8 {
-        dag = sync_headers(
+        dag = sync_headers_bounded(
             &mut session,
             &deployments,
             path.clone(),
@@ -204,7 +579,7 @@ async fn header_resync_reuses_retained_forks_on_empty_and_duplicate_polls() {
         );
         for header in &batch {
             assert_eq!(
-                dag.get(&header.block_hash()),
+                dag.header(&header.block_hash()).unwrap(),
                 reference.get(&header.block_hash())
             );
         }
@@ -243,7 +618,10 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         pending.lock().unwrap().push(local.clone()),
         BlockSubmission::Queued(_)
     ));
-    let projection = RwLock::new(dag.active_chain_snapshot());
+    let mut reference = dag.clone();
+    reference.insert_contextual(local.header, now).unwrap();
+    let mut dag = NodeHeaderState::test_seed(dag, &path);
+    let projection = RwLock::new(dag.published());
     stage_submitted_blocks(
         &pending,
         &mut dag,
@@ -256,14 +634,13 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
     )
     .unwrap();
     assert_eq!(dag.active_tip().hash, local.block_hash());
-    let locator = dag.block_locator();
+    let locator = HeaderView::block_locator(&dag).unwrap();
     let mut extension = Vec::new();
     let mut parent = fork;
     for _ in 0..3 {
         parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
         extension.push(parent);
     }
-    let mut reference = dag.clone();
     let _ = reference
         .stage_batch_contextual(&extension, now)
         .unwrap()
@@ -294,7 +671,7 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
     .await
     .unwrap();
     rbtc::header_store::REPLAYED_HEADERS.with(|count| count.set(0));
-    let dag = sync_headers(
+    let dag = sync_headers_bounded(
         &mut session,
         &deployments,
         path.clone(),
@@ -314,10 +691,10 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         dag.retained_header_count(),
         reference.retained_header_count()
     );
-    assert!(dag.get(&local.block_hash()).is_some());
-    dag.refresh_active_chain_snapshot(&mut projection.write().unwrap());
+    assert!(dag.header(&local.block_hash()).unwrap().is_some());
+    *projection.write().unwrap() = dag.published();
     assert_eq!(projection.read().unwrap().active_tip(), dag.active_tip());
-    assert_eq!(projection.read().unwrap().retained_header_count(), 5);
+    assert_eq!(projection.read().unwrap().active_tip().height, 4);
     let restored = RedbHeaderStore::open(&path)
         .unwrap()
         .load_dag(Network::Regtest, now)
@@ -328,8 +705,8 @@ async fn header_resync_preserves_local_submissions_and_promotes_a_retained_fork(
         dag.retained_header_count()
     );
     assert_eq!(
-        restored.get(&local.block_hash()),
-        dag.get(&local.block_hash())
+        restored.header(&local.block_hash()).unwrap(),
+        dag.header(&local.block_hash()).unwrap()
     );
     server.await.unwrap();
 }
@@ -419,12 +796,12 @@ async fn header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_f
     // side-chain headers are bounded and the active chain is untouched. A
     // rejected/evicted competing fork is ordinary local resource handling,
     // never a peer fault, so this call must still return `Ok`.
-    let dag = sync_headers(
+    let dag = sync_headers_bounded(
         &mut session,
         &deployments,
         path.clone(),
         &clock,
-        Some(dag),
+        Some(NodeHeaderState::test_seed(dag, &path)),
         CAP,
     )
     .await
@@ -437,17 +814,17 @@ async fn header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_f
         "ten competing forks over a cap of {CAP} must be bounded down to exactly the cap"
     );
     for header in retained_forks {
-        assert!(dag.get(&header.block_hash()).is_some());
+        assert!(dag.header(&header.block_hash()).unwrap().is_some());
     }
     for header in evicted_forks {
-        assert!(dag.get(&header.block_hash()).is_none());
+        assert!(dag.header(&header.block_hash()).unwrap().is_none());
     }
 
     // (b) The peer then extends an evicted fork past the active chain's
     // chainwork; ordinary `getheaders` resync (the active-chain locator
     // above) reacquires and revalidates it from the common ancestor, making
     // it the new active header tip.
-    let dag = sync_headers(
+    let dag = sync_headers_bounded(
         &mut session,
         &deployments,
         path.clone(),
@@ -467,10 +844,10 @@ async fn header_resync_bounds_competing_side_chains_then_reacquires_an_evicted_f
         side_after_round_two <= CAP,
         "retained {side_after_round_two} side-chain headers above the cap"
     );
-    assert!(dag.get(&reacquired.block_hash()).is_some());
+    assert!(dag.header(&reacquired.block_hash()).unwrap().is_some());
     for header in &evicted_forks[1..] {
         assert!(
-            dag.get(&header.block_hash()).is_none(),
+            dag.header(&header.block_hash()).unwrap().is_none(),
             "an evicted fork the peer never resent must not reappear on its own"
         );
     }
@@ -526,8 +903,7 @@ async fn header_resync_rejects_an_invalid_batch_without_persisting_its_prefix() 
         &deployments,
         path.clone(),
         &NetworkTime::default(),
-        Some(dag),
-        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+        Some(NodeHeaderState::test_seed(dag, &path)),
     )
     .await
     .err()
@@ -536,6 +912,7 @@ async fn header_resync_rejects_an_invalid_batch_without_persisting_its_prefix() 
     assert!(error.message.contains("median time past"));
     let store = RedbHeaderStore::open(&path).unwrap();
     assert_eq!(store.len().unwrap(), 0);
+    assert_eq!(store.recovery_tip().unwrap(), None);
     assert_eq!(
         store
             .load_dag(Network::Regtest, unix_time().unwrap())
@@ -595,8 +972,7 @@ async fn header_resync_cancellation_keeps_committed_batches_for_restart() {
         &deployments,
         path.clone(),
         &clock,
-        Some(dag),
-        DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+        Some(NodeHeaderState::test_seed(dag, &path)),
     ));
     tokio::select! {
         result = &mut syncing => panic!("sync ended before cancellation: {:?}", result.err()),
@@ -606,6 +982,7 @@ async fn header_resync_cancellation_keeps_committed_batches_for_restart() {
     drop(finish);
     server.await.unwrap();
     let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.recovery_tip().unwrap(), Some(last));
     assert_eq!(
         store.len().unwrap(),
         u64::try_from(MAX_HEADERS_PER_RESPONSE).unwrap()
@@ -661,10 +1038,9 @@ async fn header_resync_rejects_local_count_or_configuration_mismatch() {
         let error = sync_headers(
             &mut session,
             &deployments,
-            path,
+            path.clone(),
             &NetworkTime::default(),
-            Some(dag),
-            DEFAULT_MAX_SIDE_CHAIN_HEADERS,
+            Some(NodeHeaderState::test_seed(dag, &path)),
         )
         .await
         .err()
@@ -715,7 +1091,7 @@ async fn header_resync_resource_probe() {
     }
     let expected = dag.active_tip();
     let count = dag.retained_header_count();
-    let locator = dag.block_locator();
+    let locator = HeaderView::block_locator(&dag).unwrap();
     drop(dag);
     drop(store);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -744,7 +1120,7 @@ async fn header_resync_resource_probe() {
     .await
     .unwrap();
     let clock = NetworkTime::default();
-    let mut dag = sync_headers(
+    let mut dag = sync_headers_bounded(
         &mut session,
         &deployments,
         path.clone(),
@@ -772,7 +1148,7 @@ async fn header_resync_resource_probe() {
     let started = Instant::now();
     for _ in 0..rounds {
         dag = if mode == "reuse" {
-            sync_headers(
+            sync_headers_bounded(
                 &mut session,
                 &deployments,
                 path.clone(),
@@ -785,7 +1161,7 @@ async fn header_resync_resource_probe() {
         } else {
             // This is the pre-change serving-loop assignment: the old DAG
             // stays alive until full replay returns its replacement.
-            sync_headers(
+            sync_headers_bounded(
                 &mut session,
                 &deployments,
                 path.clone(),
@@ -821,4 +1197,419 @@ async fn header_resync_resource_probe() {
             "allocator": "system", "workload": "warm Redb/tmpfs and loopback V1 empty-header polls",
         })
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn disk_candidate_resumes_after_disconnect_and_defers_atomic_promotion() {
+    use crate::node::header_sync::{HeaderSyncPolicy, candidate_path, sync_headers_with_policy};
+    let peer_progress = Arc::new(HeaderPeerProgress::default());
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let mut dag = HeaderDag::new(Network::Regtest);
+    let genesis = dag.active_tip();
+    let mut parent = genesis.header;
+    let mut active = Vec::new();
+    for _ in 0..2001 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+        active.push(parent);
+    }
+    parent = genesis.header;
+    let mut fork = Vec::new();
+    for _ in 0..2002 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+        fork.push(parent);
+    }
+    let _ = dag
+        .stage_batch_contextual(&active, u32::MAX)
+        .unwrap()
+        .commit();
+    let _ = dag
+        .stage_batch_contextual(&fork[..1], u32::MAX)
+        .unwrap()
+        .commit();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.append_batch(&active).unwrap();
+    store.append_batch(&fork[..1]).unwrap();
+    drop(store);
+    let original = dag.active_tip();
+    let cursor = fork[1999].block_hash();
+    let winner = fork[2001].block_hash();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let prefix = fork[..2000].to_vec();
+    let server_progress = Arc::clone(&peer_progress);
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9711)).await;
+        let _ = next_header_request(&mut peer, &server_progress).await;
+        peer.write_message(NetworkMessage::Headers(prefix))
+            .await
+            .unwrap();
+        let request = next_header_request(&mut peer, &server_progress).await;
+        assert_eq!(request.locator_hashes[0], cursor);
+        // Disconnect with a complete, losing prefix persisted only on disk.
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9710,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let policy = HeaderSyncPolicy {
+        spill_side_headers: 0,
+        promotion_bytes: 1,
+        ..HeaderSyncPolicy::default()
+    };
+    assert!(
+        sync_headers_with_policy(
+            &mut peer,
+            &deployments,
+            path.clone(),
+            &NetworkTime::default(),
+            Some(NodeHeaderState::test_seed(dag, &path)),
+            policy
+        )
+        .await
+        .is_err()
+    );
+    server.await.unwrap();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2002);
+    let mut restored =
+        NodeHeaderState::test_seed(store.load_dag(Network::Regtest, u32::MAX).unwrap(), &path);
+    drop(store);
+    assert_eq!(restored.active_tip(), original);
+    // The candidate is anchored on a retained side header. Idle eviction must
+    // not remove it even when the execution tip matches the active tip.
+    assert_eq!(restored.retain_idle(original.hash, 0, 1).unwrap(), 0);
+    assert!(restored.header(&fork[0].block_hash()).unwrap().is_some());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let suffix = fork[2000..].to_vec();
+    let (finish_peer, finished) = tokio::sync::oneshot::channel();
+    let server_progress = Arc::clone(&peer_progress);
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9721)).await;
+        let request = next_header_request(&mut peer, &server_progress).await;
+        assert_eq!(request.locator_hashes[0], cursor);
+        peer.write_message(NetworkMessage::Headers(suffix))
+            .await
+            .unwrap();
+        serve_replay_pings_until(&mut peer, finished, &server_progress).await;
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9720,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let error = match sync_headers_with_policy(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        Some(restored),
+        policy,
+    )
+    .await
+    {
+        Ok(_) => panic!("promotion byte allowance must defer"),
+        Err(error) => error,
+    };
+    finish_peer.send(()).unwrap();
+    assert_eq!(error.kind, PeerFailureKind::LocalResource);
+    server.await.unwrap();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2002);
+    assert_eq!(
+        store
+            .load_dag(Network::Regtest, u32::MAX)
+            .unwrap()
+            .active_tip(),
+        original
+    );
+    drop(store);
+    assert!(candidate_path(&path).exists());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server_progress = Arc::clone(&peer_progress);
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9731)).await;
+        let request = next_header_request(&mut peer, &server_progress).await;
+        assert_eq!(request.locator_hashes[0], winner);
+        peer.write_message(NetworkMessage::Headers(Vec::new()))
+            .await
+            .unwrap();
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9730,
+        "/rbtc:disk/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let result = sync_headers_with_policy(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        None,
+        HeaderSyncPolicy {
+            spill_side_headers: 0,
+            promotion_bytes: 8 * 1024 * 1024,
+            ..HeaderSyncPolicy::default()
+        },
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(result.active_tip().hash, winner);
+    assert!(!candidate_path(&path).exists());
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 4003);
+    assert_eq!(
+        store
+            .load_dag(Network::Regtest, u32::MAX)
+            .unwrap()
+            .active_tip(),
+        result.active_tip()
+    );
+}
+
+/// Exercise every durable boundary around the full-candidate completion marker.
+/// These are restart-state fixtures, not a process-kill acceptance measurement.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn candidate_import_restart_never_publishes_a_partial_winner() {
+    use crate::{
+        header_candidate::{DiskHeaderCandidate, HeaderCandidateLimits},
+        header_store::HeaderStoreError,
+        headers::HeaderWorkBudget,
+        node::header_sync::{candidate_path, sync_headers},
+    };
+    for (imported, finished, startup) in [
+        (0, false, false),
+        (3, false, false),
+        (4, false, false),
+        (4, true, false),
+        (3, false, true),
+    ] {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("headers.redb");
+        let deployments = DeploymentConfig::for_network(Network::Regtest);
+        let mut dag = HeaderDag::new(Network::Regtest);
+        let genesis = dag.active_tip();
+        let mut active = Vec::new();
+        let mut parent = genesis.header;
+        for _ in 0..2 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+            active.push(parent);
+        }
+        let mut fork = Vec::new();
+        parent = genesis.header;
+        for _ in 0..4 {
+            parent = mine_regtest_child(parent.block_hash(), parent.time + 10);
+            fork.push(parent);
+        }
+        let _ = dag
+            .stage_batch_contextual(&active, u32::MAX)
+            .unwrap()
+            .commit();
+        let original = dag.active_tip();
+        let mut budget = HeaderWorkBudget::default();
+        let journal = candidate_path(&path);
+        let mut candidate = DiskHeaderCandidate::open(
+            &journal,
+            &dag,
+            genesis.hash,
+            u32::MAX,
+            HeaderCandidateLimits::default(),
+            &mut budget,
+        )
+        .unwrap();
+        candidate.append(&fork, u32::MAX, &mut budget).unwrap();
+        let winner = candidate.tip();
+        drop(candidate);
+        let store = RedbHeaderStore::open(&path).unwrap();
+        store.append_batch(&active).unwrap();
+        store.begin_candidate_promotion(winner.hash).unwrap();
+        store.append_batch(&fork[..imported]).unwrap();
+        if finished {
+            store.finish_candidate_promotion(winner.hash).unwrap();
+        } else {
+            assert!(matches!(
+                store.load_dag(Network::Regtest, u32::MAX),
+                Err(HeaderStoreError::PendingCandidate)
+            ));
+        }
+        if startup {
+            // This runs before peer creation in the real standby seed path.
+            crate::node::header_sync::recover_pending_promotion(
+                &store,
+                &path,
+                &deployments,
+                u32::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .load_dag(Network::Regtest, u32::MAX)
+                    .unwrap()
+                    .active_tip(),
+                winner
+            );
+        }
+        drop(store);
+        assert_eq!(dag.active_tip(), original);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = accept_peer(listener, peer_version(9811)).await;
+            let NetworkMessage::GetHeaders(request) =
+                peer.read_message().await.unwrap().into_payload()
+            else {
+                panic!("expected fully recovered winner");
+            };
+            assert_eq!(request.locator_hashes[0], winner.hash);
+            peer.write_message(NetworkMessage::Headers(Vec::new()))
+                .await
+                .unwrap();
+        });
+        let mut peer = connect_outbound(
+            remote,
+            Network::Regtest.magic(),
+            9810,
+            "/rbtc:restart/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        let state = sync_headers(
+            &mut peer,
+            &deployments,
+            path.clone(),
+            &NetworkTime::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        assert_eq!(state.active_tip(), winner);
+        assert!(!journal.exists());
+        let store = RedbHeaderStore::open(&path).unwrap();
+        assert_eq!(store.pending_candidate_tip().unwrap(), None);
+        assert_eq!(store.len().unwrap(), 6);
+        assert_eq!(
+            store
+                .load_dag(Network::Regtest, u32::MAX)
+                .unwrap()
+                .active_tip(),
+            winner
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_pending_candidate_fails_locally_before_network_request() {
+    use crate::node::header_sync::sync_headers;
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("headers.redb");
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let genesis = HeaderDag::new(Network::Regtest).active_tip();
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.begin_candidate_promotion(genesis.hash).unwrap();
+    drop(store);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut peer, _) = accept_peer(listener, peer_version(9821)).await;
+        // The client closes without sending any getheaders request.
+        assert!(peer.read_message().await.is_err());
+    });
+    let mut peer = connect_outbound(
+        remote,
+        Network::Regtest.magic(),
+        9820,
+        "/rbtc:missing/".to_owned(),
+        0,
+    )
+    .await
+    .unwrap();
+    let result = sync_headers(
+        &mut peer,
+        &deployments,
+        path.clone(),
+        &NetworkTime::default(),
+        None,
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("missing journal must fail");
+    };
+    assert_eq!(error.kind, PeerFailureKind::LocalResource);
+    drop(peer);
+    server.await.unwrap();
+    assert_eq!(
+        RedbHeaderStore::open(&path)
+            .unwrap()
+            .pending_candidate_tip()
+            .unwrap(),
+        Some(genesis.hash)
+    );
+}
+
+#[tokio::test]
+async fn disk_reindex_resumes_a_multi_frame_prefix_and_rejects_divergence() {
+    let directory = TempDir::new().unwrap();
+    let deployments = DeploymentConfig::for_network(Network::Regtest);
+    let mut source = HeaderDag::with_deployments(deployments.clone());
+    let genesis = source.active_tip().header;
+    let mut parent = genesis;
+    let mut headers = Vec::new();
+    for _ in 0..2001 {
+        parent = mine_regtest_child(parent.block_hash(), parent.time + 1);
+        headers.push(parent);
+    }
+    let _ = source
+        .stage_batch_contextual(&headers, unix_time().unwrap())
+        .unwrap()
+        .commit();
+    let path = directory.path().join("headers.redb");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    store.append_batch(&headers[..2000]).unwrap();
+    drop(store);
+    let state = prepare_reindex_headers(directory.path(), &source, &deployments)
+        .await
+        .unwrap();
+    assert_eq!(state.active_tip(), source.active_tip());
+    drop(state);
+    let state = prepare_reindex_headers(directory.path(), &source, &deployments)
+        .await
+        .unwrap();
+    assert_eq!(state.active_tip(), source.active_tip());
+    drop(state);
+    let mut other = HeaderDag::with_deployments(deployments.clone());
+    other
+        .insert_contextual(
+            mine_regtest_child(genesis.block_hash(), genesis.time + 2),
+            unix_time().unwrap(),
+        )
+        .unwrap();
+    let error = prepare_reindex_headers(directory.path(), &other, &deployments)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("prefix diverges"), "{error}");
+    let store = RedbHeaderStore::open(&path).unwrap();
+    assert_eq!(store.len().unwrap(), 2001);
 }

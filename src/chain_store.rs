@@ -19,7 +19,7 @@ use crate::{
         advance_transaction, assume_snapshot_transaction, clear_assumed_snapshot_transaction,
         metadata_exists as execution_metadata_exists, rewind_transaction,
     },
-    headers::HeaderDag,
+    headers::HeaderView,
     undo_store::{
         RedbUndoStore, UndoStoreError, clear_block_undos_database,
         insert_transaction as insert_undo_transaction,
@@ -81,6 +81,18 @@ impl Default for ChainStoreOptions {
 /// Errors from the unified chain-state database.
 #[derive(Debug, Error)]
 pub enum ChainStoreError {
+    /// Reading local execution inputs failed independently of peer validity.
+    #[error("execution input read: {0}")]
+    ExecutionRead(UtxoError),
+    /// Execution preparation could not obtain its shared allocation allowance.
+    #[error("execution memory admission: {0}")]
+    ExecutionMemory(std::io::Error),
+    /// Temporary execution results could not be admitted, written or read locally.
+    #[error("execution spool: {0}")]
+    ExecutionSpool(std::io::Error),
+    /// A validated local header could not be read; the operation is not published.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] crate::headers::HeaderReadError),
     /// The database is structurally damaged and could not be opened safely.
     #[error("chainstate database is truncated or structurally damaged")]
     Damaged,
@@ -201,8 +213,13 @@ pub struct RedbChainStore {
     options: ChainStoreOptions,
     validation_journal: Option<Mutex<ValidationJournal>>,
     write_guard: Mutex<()>,
+    execution_spool: Option<crate::execution_spool::ExecutionSpoolContext>,
 }
 
+// Exists only inside an uncommitted materialization transaction. Distinct-key
+// accounting must not grow a process-resident set across the whole journal.
+const MATERIALIZATION_KEYS: TableDefinition<&[u8], ()> =
+    TableDefinition::new("validation_materialization_keys");
 const VALIDATION_DELTA_TABLE: TableDefinition<u32, &[u8]> =
     TableDefinition::new("validation_utxo_deltas");
 const VALIDATION_DELTA_SHARD_TABLE: TableDefinition<&[u8], &[u8]> =
@@ -434,6 +451,99 @@ pub struct ConnectTransition {
     pub transaction_undos: Vec<UtxoUndo>,
 }
 
+/// An owned transition whose optional memory reservation follows its payload.
+///
+/// A spool reader must acquire its lease before decoding. Streaming engines
+/// release the lease after consuming this block; compatibility collectors keep
+/// it until their buffered payload is committed or discarded.
+pub struct LeasedConnectTransition {
+    transition: ConnectTransition,
+    reservation: Option<Arc<crate::node_memory::MemoryLease>>,
+}
+impl LeasedConnectTransition {
+    /// Attaches a reservation acquired before constructing/decoding the payload.
+    #[must_use]
+    pub fn with_reservation(
+        transition: ConnectTransition,
+        reservation: crate::node_memory::MemoryLease,
+    ) -> Self {
+        Self::with_shared_reservation(transition, Arc::new(reservation))
+    }
+
+    pub(crate) fn with_shared_reservation(
+        transition: ConnectTransition,
+        reservation: Arc<crate::node_memory::MemoryLease>,
+    ) -> Self {
+        for undo in &transition.transaction_undos {
+            undo.retain_memory(Arc::clone(&reservation));
+        }
+        Self {
+            transition,
+            reservation: Some(reservation),
+        }
+    }
+}
+impl From<ConnectTransition> for LeasedConnectTransition {
+    /// Wraps an existing caller-owned transition without claiming it was budgeted.
+    fn from(transition: ConnectTransition) -> Self {
+        Self {
+            transition,
+            reservation: None,
+        }
+    }
+}
+impl std::ops::Deref for LeasedConnectTransition {
+    type Target = ConnectTransition;
+    fn deref(&self) -> &Self::Target {
+        &self.transition
+    }
+}
+impl std::ops::DerefMut for LeasedConnectTransition {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.transition
+    }
+}
+impl std::borrow::Borrow<ConnectTransition> for LeasedConnectTransition {
+    fn borrow(&self) -> &ConnectTransition {
+        &self.transition
+    }
+}
+
+// Field order drops payloads before returning their reservation.
+pub(crate) struct CollectedTransitions {
+    pub(crate) transitions: Vec<ConnectTransition>,
+    pub(crate) leases: Vec<Arc<crate::node_memory::MemoryLease>>,
+}
+
+pub(crate) fn collect_transition_stream(
+    transitions: &mut dyn ExactSizeIterator<
+        Item = Result<LeasedConnectTransition, ChainStoreError>,
+    >,
+    final_tip: Option<ExecutionTip>,
+) -> Result<CollectedTransitions, ChainStoreError> {
+    let expected = transitions.len();
+    let mut collected = CollectedTransitions {
+        transitions: Vec::new(),
+        leases: Vec::new(),
+    };
+    for item in transitions {
+        let LeasedConnectTransition {
+            transition,
+            reservation,
+        } = item?;
+        collected.transitions.push(transition);
+        if let Some(reservation) = reservation {
+            collected.leases.push(reservation);
+        }
+    }
+    if collected.transitions.len() != expected
+        || collected.transitions.last().map(|item| item.next) != final_tip
+    {
+        return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+    }
+    Ok(collected)
+}
+
 /// Atomic chainstate surface block execution needs to connect and disconnect
 /// active blocks.
 ///
@@ -470,7 +580,9 @@ pub trait ExecutionChainStore: UtxoStore {
                 "prefetch refresh returned misaligned coins",
             ));
         }
-        entries.clone_from_slice(&current);
+        for (entry, refreshed) in entries.iter_mut().zip(current) {
+            *entry = refreshed;
+        }
         Ok(())
     }
 
@@ -510,40 +622,65 @@ pub trait ExecutionChainStore: UtxoStore {
     ) -> Result<(), ChainStoreError> {
         self.commit_connect_batch(&transitions)
     }
+    /// Optional temporary-result storage sharing the node's resource owner.
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        None
+    }
+    /// Consumes transitions while preserving one atomic publication boundary.
+    ///
+    /// A late source error must leave no committed prefix. `final_tip` binds
+    /// the intended end and must be absent exactly for an empty stream.
+    /// Implementations may materialize this compatibility fallback; stores
+    /// supporting bounded consumption override it. Leased sources require an
+    /// override that retains their reservations for the actual payload lifetime.
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let collected = collect_transition_stream(transitions, final_tip)?;
+        if !collected.leases.is_empty() {
+            // Unknown implementations may retain owned inputs after return.
+            // They must override this method to retain their leases as well.
+            return Err(
+                UtxoError::Malformed("store does not support leased transition streams").into(),
+            );
+        }
+        self.commit_connect_batch_owned(collected.transitions)
+    }
     /// Commits a batch whose net coin change the caller already folded.
     ///
     /// `transitions` carry the per-block tips and undo records; their own
     /// coin lists are ignored (a write-back buffer drains them as it folds).
     /// `spent` and `created` are the batch's net change in key order. The
-    /// default walks the blocks with [`Self::commit_connect`], landing the
-    /// coins with the final block — correct but not atomic across blocks;
-    /// engines with an atomic batch commit override it.
+    /// default builds one atomic batch with the net coins on its final block.
+    /// This compatibility fallback clones undo records and net coins; engines
+    /// can override it to avoid materializing those copies.
     fn commit_connect_folded(
         &self,
         transitions: &[ConnectTransition],
         spent: &[OutPointKey],
         created: &[(OutPointKey, Utxo)],
     ) -> Result<(), ChainStoreError> {
-        let Some((last, rest)) = transitions.split_last() else {
+        if transitions.is_empty() {
             return Ok(());
-        };
-        for transition in rest {
-            self.commit_connect(
-                transition.expected_parent,
-                transition.next,
-                &[],
-                &[],
-                &transition.transaction_undos,
-            )?;
         }
-        self.commit_connect(
-            last.expected_parent,
-            last.next,
-            spent,
-            created,
-            &last.transaction_undos,
-        )?;
-        Ok(())
+        let mut batch: Vec<_> = transitions
+            .iter()
+            .map(|transition| ConnectTransition {
+                expected_parent: transition.expected_parent,
+                next: transition.next,
+                spent: Vec::new(),
+                created: Vec::new(),
+                transaction_undos: transition.transaction_undos.clone(),
+            })
+            .collect();
+        let last = batch.last_mut().expect("nonempty transitions");
+        last.spent = spent.to_vec();
+        last.created = created.to_vec();
+        self.commit_connect_batch_owned(batch)
     }
     /// Reverses the tip block and removes its undo in one transaction.
     fn commit_disconnect(
@@ -561,7 +698,7 @@ pub trait ExecutionChainStore: UtxoStore {
     /// override this so the retained-ledger floor also bounds undo growth.
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         let (_, _) = (headers, retain_from_height);
@@ -586,6 +723,10 @@ pub trait ExecutionChainStore: UtxoStore {
 }
 
 impl ExecutionChainStore for RedbChainStore {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.execution_spool.clone()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         Ok(self.execution().tip()?)
     }
@@ -627,6 +768,16 @@ impl ExecutionChainStore for RedbChainStore {
         RedbChainStore::commit_connect_batch(self, transitions)
     }
 
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        self.commit_transition_stream(transitions, final_tip)
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,
@@ -647,7 +798,7 @@ impl ExecutionChainStore for RedbChainStore {
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         RedbChainStore::prune_block_undos_before(self, headers, retain_from_height)
@@ -877,15 +1028,36 @@ fn validation_delta_record_header(
 
 fn decode_validation_delta_record<F>(
     encoded: &[u8],
-    mut load_shard: F,
+    load_shard: F,
 ) -> Result<(u64, ValidationDeltaUpdates), UtxoError>
 where
     F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
 {
+    let mut updates = Vec::new();
+    let utxo_count = visit_validation_delta_record(encoded, load_shard, |shard| {
+        updates.extend(shard);
+        Ok(())
+    })?;
+    Ok((utxo_count, updates))
+}
+
+fn visit_validation_delta_record<F, V>(
+    encoded: &[u8],
+    mut load_shard: F,
+    mut visit: V,
+) -> Result<u64, UtxoError>
+where
+    F: FnMut(u8) -> Result<Vec<u8>, UtxoError>,
+    V: FnMut(ValidationDeltaUpdates) -> Result<(), UtxoError>,
+{
     match validation_delta_record_header(encoded)? {
-        ValidationDeltaRecordHeader::Legacy { .. } => decode_validation_delta(encoded),
+        ValidationDeltaRecordHeader::Legacy { .. } => {
+            let (utxo_count, updates) = decode_validation_delta(encoded)?;
+            visit(updates)?;
+            Ok(utxo_count)
+        }
         ValidationDeltaRecordHeader::Sharded(header) => {
-            let mut updates = Vec::with_capacity(header.update_count);
+            let mut update_count = 0_usize;
             for shard in 0..header.shard_count {
                 let shard = u8::try_from(shard).expect("validation shard fits u8");
                 if !validation_shard_is_populated(header, shard) {
@@ -903,14 +1075,20 @@ where
                         "validation delta shard content mismatch",
                     ));
                 }
-                updates.extend(shard_updates);
+                update_count =
+                    update_count
+                        .checked_add(shard_updates.len())
+                        .ok_or(UtxoError::Malformed(
+                            "validation delta shard count overflow",
+                        ))?;
+                visit(shard_updates)?;
             }
-            if updates.len() != header.update_count {
+            if update_count != header.update_count {
                 return Err(UtxoError::Malformed(
                     "validation delta shard count mismatch",
                 ));
             }
-            Ok((header.utxo_count, updates))
+            Ok(header.utxo_count)
         }
     }
 }
@@ -1338,16 +1516,21 @@ impl RedbChainStore {
         // Convert that boundary panic into an explicit startup rejection so a
         // damaged chainstate cannot take the daemon down without diagnosis.
         let mut database = catch_unwind(AssertUnwindSafe(|| {
-            Database::builder()
-                .set_cache_size(options.cache_size_bytes)
-                .create(path)
+            crate::node_memory::open_redb(path.as_ref(), options.cache_size_bytes)
         }))
         .map_err(|_| ChainStoreError::Damaged)??;
         if !options.retain_block_undo && clear_block_undos_database(&database)? {
             database.compact()?;
         }
         let db = Arc::new(database);
-        Self::from_database(db, network, options)
+        let mut store = Self::from_database(db, network, options)?;
+        store.execution_spool =
+            crate::execution_spool::ExecutionSpoolContext::for_path(path.as_ref())
+                .map_err(ChainStoreError::ExecutionSpool)?;
+        if store.execution_spool.is_some() {
+            store.utxos.constrain_script_reads();
+        }
+        Ok(store)
     }
 
     /// Compacts a closed chainstate database and reports whether maintenance work ran.
@@ -1357,7 +1540,7 @@ impl RedbChainStore {
     /// protocol; a structurally damaged file is rejected rather than rewritten.
     pub fn compact_file(path: impl AsRef<Path>) -> Result<bool, ChainStoreError> {
         catch_unwind(AssertUnwindSafe(|| {
-            let mut database = Database::open(path)?;
+            let mut database = crate::node_memory::open_existing_redb(path)?;
             Ok(database.compact()?)
         }))
         .map_err(|_| ChainStoreError::Damaged)?
@@ -1582,6 +1765,7 @@ impl RedbChainStore {
             options,
             validation_journal,
             write_guard: Mutex::new(()),
+            execution_spool: None,
         })
     }
 
@@ -1597,7 +1781,7 @@ impl RedbChainStore {
     /// unknown record fails closed before a write transaction begins.
     pub fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         if !self.options.retain_block_undo {
@@ -1608,12 +1792,10 @@ impl RedbChainStore {
             .hashes()?
             .into_iter()
             .map(|hash| {
-                headers
-                    .get(&hash)
-                    .map(|header| (header.height, hash))
-                    .ok_or(UndoStoreError::Malformed(
-                        "block undo references an unknown header",
-                    ))
+                let header = headers.header(&hash)?.ok_or(UndoStoreError::Malformed(
+                    "block undo references an unknown header",
+                ))?;
+                Ok::<_, ChainStoreError>((header.height, hash))
             })
             .collect::<Result<Vec<_>, _>>()?;
         expired.retain(|(height, _)| *height < retain_from_height);
@@ -1710,6 +1892,8 @@ impl RedbChainStore {
     /// The journal, base tables, and execution metadata share this database,
     /// so either the complete materialized state or the complete journal-backed
     /// state survives a crash. The store remains in journal mode afterward.
+    /// Application allocations retain only one decoded shard (or legacy row)
+    /// at a time; engine dirty pages remain part of the atomic transaction.
     pub fn materialize_validation_deltas(&self) -> Result<u64, ChainStoreError> {
         let Some(validation_journal) = &self.validation_journal else {
             return Ok(0);
@@ -1722,47 +1906,56 @@ impl RedbChainStore {
         if journal.rows.is_empty() {
             return Ok(0);
         }
-        let updates = {
-            let transaction = self.db.begin_read()?;
-            let deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
-            let delta_shards = transaction.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
-            let mut updates: AHashMap<OutPointKey, ValidationUpdate> = AHashMap::new();
+        let source = self.db.begin_read()?;
+        let deltas = source.open_table(VALIDATION_DELTA_TABLE)?;
+        let delta_shards = source.open_table(VALIDATION_DELTA_SHARD_TABLE)?;
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let mut count = 0_u64;
+        {
+            let mut seen = transaction.open_table(MATERIALIZATION_KEYS)?;
+            if !seen.is_empty()? {
+                return Err(
+                    UtxoError::Malformed("unexpected materialization scratch records").into(),
+                );
+            }
             for row in &journal.rows {
                 let encoded = deltas
                     .get(row.height)?
                     .ok_or(UtxoError::Malformed("missing validation delta row"))?;
-                let decoded = decode_validation_delta_record(encoded.value(), |shard| {
-                    let key = validation_delta_shard_key(row.height, shard);
-                    delta_shards
-                        .get(key.as_slice())?
-                        .map(|encoded| encoded.value().to_vec())
-                        .ok_or(UtxoError::Malformed("missing validation delta shard"))
-                })?;
-                for (outpoint, update) in decoded.1 {
-                    if let Some(current) = updates.get_mut(&outpoint) {
-                        current.utxo = update.utxo;
-                    } else {
-                        updates.insert(outpoint, update);
-                    }
-                }
-            }
-            updates
-        };
-        let mut spent = Vec::new();
-        let mut created = Vec::new();
-        let mut ordered = updates.iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(outpoint, _)| **outpoint);
-        for (outpoint, update) in ordered {
-            if update.spent_in_batch {
-                spent.push(*outpoint);
-            }
-            if let Some(utxo) = &update.utxo {
-                created.push((*outpoint, utxo.clone()));
+                visit_validation_delta_record(
+                    encoded.value(),
+                    |shard| {
+                        let key = validation_delta_shard_key(row.height, shard);
+                        delta_shards
+                            .get(key.as_slice())?
+                            .map(|encoded| encoded.value().to_vec())
+                            .ok_or(UtxoError::Malformed("missing validation delta shard"))
+                    },
+                    |updates| {
+                        // Applying rows in journal order preserves intra-journal spends
+                        // without retaining every historical update or cloning UTXOs.
+                        let mut spent = Vec::new();
+                        let mut created = Vec::new();
+                        for (outpoint, update) in updates {
+                            if seen.insert(outpoint.as_bytes().as_slice(), ())?.is_none() {
+                                count += 1;
+                            }
+                            if update.spent_in_batch {
+                                spent.push(outpoint);
+                            }
+                            if let Some(utxo) = update.utxo {
+                                created.push((outpoint, utxo));
+                            }
+                        }
+                        spent.sort_unstable();
+                        created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
+                        apply_validated_changes_transaction(&transaction, &spent, &created)
+                    },
+                )?;
             }
         }
-        let mut transaction = self.db.begin_write()?;
-        self.configure(&mut transaction);
-        apply_validated_changes_transaction(&transaction, &spent, &created)?;
+        transaction.delete_table(MATERIALIZATION_KEYS)?;
         {
             let mut deltas = transaction.open_table(VALIDATION_DELTA_TABLE)?;
             deltas.retain(|_, _| false)?;
@@ -1774,7 +1967,6 @@ impl RedbChainStore {
             groups.retain(|_, _| false)?;
         }
         transaction.commit()?;
-        let count = u64::try_from(updates.len()).expect("usize fits u64");
         journal.rows.clear();
         journal.groups.clear();
         Ok(count)
@@ -2202,7 +2394,7 @@ impl RedbChainStore {
     pub fn finalize_assumed_snapshot(
         &self,
         validation: &Self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
     ) -> Result<AssumedSnapshot, ChainStoreError> {
         let _guard = self.lock();
         let assumed = self
@@ -2234,7 +2426,7 @@ impl RedbChainStore {
             return Err(ChainStoreError::ValidationConsensusMismatch);
         }
         if headers
-            .active_header_at(assumed.base.height)
+            .active_header(assumed.base.height)?
             .is_none_or(|header| header.hash != assumed.base.hash)
         {
             return Err(ChainStoreError::SnapshotBaseNotActive {
@@ -2244,7 +2436,7 @@ impl RedbChainStore {
         }
         let active_tip = self.execution.tip()?;
         if headers
-            .active_header_at(active_tip.height)
+            .active_header(active_tip.height)?
             .is_none_or(|header| header.hash != active_tip.hash)
         {
             return Err(ChainStoreError::ExecutionTipNotActive {
@@ -2467,6 +2659,82 @@ impl RedbChainStore {
             advance_transaction(&transaction, transition.expected_parent, transition.next)?;
         }
         connect_spent_ages_transaction(&transaction, &age_counts, first_height, final_height)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn commit_transition_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let expected = transitions.len();
+        if self.validation_journal.is_some() {
+            // Journal checkpoints still fold one net row. Retain that format
+            // until its bounded spool path can preserve the same semantics.
+            let collected = collect_transition_stream(transitions, final_tip)?;
+            return self.commit_connect_batch(&collected.transitions);
+        }
+        if expected == 0 {
+            return if final_tip.is_none() {
+                Ok(())
+            } else {
+                Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into())
+            };
+        }
+        let _bulk_guard = bulk_commit_guard();
+        let _guard = self.lock();
+        let mut transaction = self.db.begin_write()?;
+        self.configure(&mut transaction);
+        let mut count = 0;
+        let mut last = None;
+        for transition in transitions {
+            let mut transition = transition?;
+            transition.spent.sort_unstable();
+            transition.created.sort_unstable_by_key(|(key, _)| *key);
+            if let Some(keys) = transition.spent.windows(2).find(|keys| keys[0] == keys[1]) {
+                return Err(UtxoError::DuplicateSpend(keys[0]).into());
+            }
+            if let Some(rows) = transition
+                .created
+                .windows(2)
+                .find(|rows| rows[0].0 == rows[1].0)
+            {
+                return Err(UtxoError::Duplicate(rows[0].0).into());
+            }
+            // Validate and apply one block inside the still-unpublished write.
+            // The next block can spend outputs this block just created.
+            let ages = spent_age_counts([(
+                transition.next.height,
+                transition.transaction_undos.as_slice(),
+            )])?;
+            apply_validated_changes_transaction(
+                &transaction,
+                &transition.spent,
+                &transition.created,
+            )?;
+            if self.options.retain_block_undo {
+                insert_undo_transaction(
+                    &transaction,
+                    transition.next.hash,
+                    &transition.transaction_undos,
+                )?;
+            }
+            advance_transaction(&transaction, transition.expected_parent, transition.next)?;
+            connect_spent_ages_transaction(
+                &transaction,
+                &ages,
+                transition.next.height,
+                transition.next.height,
+            )?;
+            count += 1;
+            last = Some(transition.next);
+        }
+        if count != expected || last != final_tip {
+            return Err(UtxoError::Malformed("atomic transition stream endpoint mismatch").into());
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2959,6 +3227,7 @@ impl UtxoStore for RedbChainStore {
 
 #[cfg(test)]
 mod tests {
+    use crate::headers::HeaderDag;
     use std::{
         fmt, io,
         sync::{
@@ -2992,6 +3261,245 @@ mod tests {
             creation_mtp: 0,
             script_pubkey: vec![0x51],
         }
+    }
+
+    fn assert_atomic_folded_failure(store: &impl ExecutionChainStore) {
+        let genesis = store.execution_tip().unwrap();
+        let one = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([91; 32]),
+        };
+        let two = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([92; 32]),
+        };
+        let transitions = vec![
+            ConnectTransition {
+                expected_parent: genesis.hash,
+                next: one,
+                spent: vec![],
+                created: vec![],
+                transaction_undos: vec![],
+            },
+            ConnectTransition {
+                expected_parent: one.hash,
+                next: two,
+                spent: vec![],
+                created: vec![],
+                transaction_undos: vec![],
+            },
+        ];
+        // Missing base coin is discovered when the folded changes reach the
+        // engine. It must not leave a tip/undo prefix from earlier blocks.
+        assert!(
+            store
+                .commit_connect_folded(&transitions, &[key(90)], &[(key(91), coin(20))])
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.block_undo(one.hash).unwrap().is_none());
+        assert!(store.block_undo(two.hash).unwrap().is_none());
+        assert!(store.get(key(91)).unwrap().is_none());
+        store
+            .commit_connect_folded(&transitions, &[], &[(key(91), coin(20))])
+            .unwrap();
+        assert_eq!(store.execution_tip().unwrap(), two);
+        assert_eq!(store.get(key(91)).unwrap().unwrap().value_sats, 20);
+        assert!(store.block_undo(one.hash).unwrap().is_some());
+        assert!(store.block_undo(two.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn redb_folded_failure_never_publishes_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = RedbChainStore::open(dir.path().join("folded.redb"), Network::Regtest).unwrap();
+        assert_atomic_folded_failure(&store);
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn mdbx_folded_failure_never_publishes_a_prefix() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("folded")).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([90; 32]),
+            })
+            .unwrap();
+        assert_atomic_folded_failure(&store);
+    }
+
+    fn assert_atomic_transition_stream(store: &impl ExecutionChainStore, expected_peak: u64) {
+        let genesis = store.execution_tip().unwrap();
+        let one = ExecutionTip {
+            height: 1,
+            hash: BlockHash::from_byte_array([81; 32]),
+        };
+        let two = ExecutionTip {
+            height: 2,
+            hash: BlockHash::from_byte_array([82; 32]),
+        };
+        let first = ConnectTransition {
+            expected_parent: genesis.hash,
+            next: one,
+            spent: vec![],
+            // The public stream accepts unsorted caller changes too.
+            created: vec![(key(2), coin(20)), (key(1), coin(10))],
+            transaction_undos: vec![],
+        };
+        let second = ConnectTransition {
+            expected_parent: one.hash,
+            next: two,
+            spent: vec![key(1)],
+            created: vec![(key(3), coin(10))],
+            transaction_undos: vec![],
+        };
+        let mut failed = vec![
+            Ok(first.clone().into()),
+            Err(UtxoError::Malformed("late spool read failure").into()),
+        ]
+        .into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut failed, Some(two))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert!(store.get(key(2)).unwrap().is_none());
+        assert!(store.block_undo(one.hash).unwrap().is_none());
+
+        let wrong_end = ExecutionTip {
+            hash: BlockHash::from_byte_array([83; 32]),
+            ..two
+        };
+        let mut wrong = vec![Ok(first.clone().into()), Ok(second.clone().into())].into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut wrong, Some(wrong_end))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(store.get(key(3)).unwrap().is_none());
+        assert!(store.block_undo(two.hash).unwrap().is_none());
+
+        let mut duplicate = first.clone();
+        duplicate.created.push((key(1), coin(10)));
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut vec![Ok(duplicate.into())].into_iter(), Some(one))
+                .is_err()
+        );
+        assert_eq!(store.execution_tip().unwrap(), genesis);
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut std::iter::empty(), Some(one))
+                .is_err()
+        );
+        store
+            .commit_connect_batch_stream(&mut std::iter::empty(), None)
+            .unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(200);
+        let mut valid = vec![first, second].into_iter().map(|transition| {
+            Ok(LeasedConnectTransition::with_reservation(
+                transition,
+                budget.reserve(100).unwrap(),
+            ))
+        });
+        store
+            .commit_connect_batch_stream(&mut valid, Some(two))
+            .unwrap();
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.snapshot().peak, expected_peak);
+        assert_eq!(store.execution_tip().unwrap(), two);
+        assert!(store.get(key(1)).unwrap().is_none());
+        assert_eq!(store.get(key(2)).unwrap().unwrap().value_sats, 20);
+        assert_eq!(store.get(key(3)).unwrap().unwrap().value_sats, 10);
+        assert!(store.block_undo(one.hash).unwrap().is_some());
+        assert!(store.block_undo(two.hash).unwrap().is_some());
+    }
+
+    #[test]
+    fn shared_undo_keeps_transition_admission_after_its_container_drops() {
+        let memory = crate::node_memory::MemoryBudget::new(100);
+        let undo = UtxoUndo::from_parts(vec![(key(1), coin(10))], vec![key(2)]);
+        let escaped = undo.clone();
+        let transition = ConnectTransition {
+            expected_parent: BlockHash::all_zeros(),
+            next: ExecutionTip {
+                height: 1,
+                hash: BlockHash::all_zeros(),
+            },
+            spent: vec![],
+            created: vec![],
+            transaction_undos: vec![undo],
+        };
+        let leased =
+            LeasedConnectTransition::with_reservation(transition, memory.reserve(100).unwrap());
+        let returned = leased.transaction_undos.clone();
+        drop(leased);
+        assert_eq!(memory.snapshot().used, 100);
+        assert!(memory.reserve(1).is_err());
+        assert_eq!(escaped.spent(), returned[0].spent());
+        drop(returned);
+        assert_eq!(
+            memory.snapshot().used,
+            100,
+            "even a pre-existing alias retains the admitted payload"
+        );
+        drop(escaped);
+        assert_eq!(memory.snapshot().used, 0);
+        assert!(memory.reserve(100).is_ok());
+    }
+
+    #[test]
+    fn redb_transition_stream_is_atomic_on_late_source_and_endpoint_errors() {
+        for journal in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let store = RedbChainStore::open_with_options(
+                dir.path().join("chain.redb"),
+                Network::Regtest,
+                ChainStoreOptions {
+                    validation_delta_journal: journal,
+                    ..ChainStoreOptions::default()
+                },
+            )
+            .unwrap();
+            assert_atomic_transition_stream(&store, if journal { 200 } else { 100 });
+            let tip = store.execution_tip().unwrap();
+            drop(store);
+            let reopened = RedbChainStore::open_with_options(
+                dir.path().join("chain.redb"),
+                Network::Regtest,
+                ChainStoreOptions {
+                    validation_delta_journal: journal,
+                    ..ChainStoreOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(reopened.execution_tip().unwrap(), tip);
+            assert_eq!(reopened.get(key(3)).unwrap().unwrap().value_sats, 10);
+        }
+    }
+
+    #[cfg(feature = "mdbx")]
+    #[test]
+    fn mdbx_transition_stream_is_atomic_on_late_source_and_endpoint_errors() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("chain")).unwrap();
+        store
+            .initialize_execution_tip(ExecutionTip {
+                height: 0,
+                hash: BlockHash::from_byte_array([80; 32]),
+            })
+            .unwrap();
+        assert_atomic_transition_stream(&store, 100);
+        let tip = store.execution_tip().unwrap();
+        drop(store);
+        let reopened = crate::mdbx_utxo::MdbxUtxoStore::open(dir.path().join("chain")).unwrap();
+        assert_eq!(reopened.execution_tip().unwrap(), tip);
+        assert_eq!(reopened.get(key(3)).unwrap().unwrap().value_sats, 10);
     }
 
     fn snapshot_digest(entries: &BTreeMap<OutPointKey, Utxo>) -> [u8; 32] {
@@ -3928,6 +4436,94 @@ mod tests {
         assert_eq!(
             partition_validation_bloom_matches(&bloom, &outpoints, indices),
             expected
+        );
+    }
+
+    #[test]
+    fn materialization_rolls_back_prior_rows_when_a_late_row_is_missing() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let base = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        base.apply(&[], &[(key(1), coin(10))]).unwrap();
+        drop(base);
+        let store = RedbChainStore::open_with_options(
+            &path,
+            Network::Regtest,
+            ChainStoreOptions {
+                validation_delta_journal: true,
+                ..ChainStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let mut tip = store.execution().tip().unwrap();
+        for height in 1..=2_u8 {
+            let next = ExecutionTip {
+                height: u32::from(height),
+                hash: BlockHash::from_byte_array([height; 32]),
+            };
+            store
+                .commit_connect_batch(&[ConnectTransition {
+                    expected_parent: tip.hash,
+                    next,
+                    spent: vec![key(height)],
+                    created: vec![(key(height + 1), coin(10))],
+                    transaction_undos: vec![],
+                }])
+                .unwrap();
+            tip = next;
+        }
+        let write = store.db.begin_write().unwrap();
+        let encoded = write
+            .open_table(VALIDATION_DELTA_TABLE)
+            .unwrap()
+            .remove(2)
+            .unwrap()
+            .unwrap()
+            .value()
+            .to_vec();
+        write.commit().unwrap();
+        assert!(store.materialize_validation_deltas().is_err());
+        // Row one was applied inside the failed transaction, never published.
+        assert_eq!(store.utxos.get(key(1)).unwrap(), Some(coin(10)));
+        assert!(store.utxos.get(key(2)).unwrap().is_none());
+        assert!(store.utxos.get(key(3)).unwrap().is_none());
+        assert_eq!(store.execution().tip().unwrap(), tip);
+        assert_eq!(
+            store
+                .validation_journal
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(MATERIALIZATION_KEYS)
+                .is_err()
+        );
+        let write = store.db.begin_write().unwrap();
+        write
+            .open_table(VALIDATION_DELTA_TABLE)
+            .unwrap()
+            .insert(2, encoded.as_slice())
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(store.materialize_validation_deltas().unwrap(), 3);
+        assert_eq!(store.utxos.get(key(3)).unwrap(), Some(coin(10)));
+        assert!(store.utxos.get(key(1)).unwrap().is_none());
+        assert!(
+            store
+                .db
+                .begin_read()
+                .unwrap()
+                .open_table(MATERIALIZATION_KEYS)
+                .is_err()
         );
     }
 

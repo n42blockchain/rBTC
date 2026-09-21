@@ -1,7 +1,7 @@
 {
   "format": 1,
-  "tested_commit": null,
-  "source_sha256": null,
+  "tested_commit": "3cf44ae68003ceb78e9f0c77042667b475091716",
+  "source_sha256": "41531cb896eba13a13fabde1170e519ab3b90c4b0940232c45125120bfdc0431",
   "gates": {
     "optimizer-budget": {
       "status": "open",
@@ -15,13 +15,16 @@
     },
     "header-resources": {
       "status": "open",
-      "reason": "Ingress evicts low-work side-chain headers above a cap, a 100,000-header hostile feeder stays within cap and storage plateau, and stronger forks are reacquired; live-process sustained acceptance remains open.",
+      "reason": "Ingress eviction, idle retention, atomic durable fork cursors, emergency staging/replay entry ceilings, and a bounded hostile-header feeder exist; calibrated byte/work budgets, disk-backed oversized-fork recovery, and sustained whole-node acceptance remain open.",
       "evidence": []
     },
     "storage-replay": {
-      "status": "open",
-      "reason": "The 935001-963350 replay passed at b078798; final frozen release source acceptance is pending.",
-      "evidence": []
+      "status": "accepted",
+      "reason": "The 935001-963350 snapshot replay passed on the frozen source in both redb and MDBX with matching canonical content and fresh-process audits.",
+      "evidence": [{
+        "path": "release/acceptance/storage-replay-20260915.md",
+        "sha256": "feac60dd67a52f680643905aadbfa85cab3ab11180712e88505d67994e46dbde"
+      }]
     },
     "public-soak": {
       "status": "open",

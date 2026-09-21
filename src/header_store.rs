@@ -19,11 +19,22 @@ use crate::{
     headers::{HeaderDag, HeaderError, StagedHeaderEviction},
 };
 
+/// Header-store page-cache allowance, independent of retained DAG entries.
+/// Redb transaction/repair buffers and the OS page cache are separate resources.
+pub const HEADER_STORE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("headers_by_hash");
 const INSERTION_ORDER: TableDefinition<u64, &[u8]> = TableDefinition::new("header_insertion_order");
 const HASH_SEQUENCE: TableDefinition<&[u8], u64> = TableDefinition::new("header_hash_sequence");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("header_metadata");
 const NEXT_SEQUENCE_KEY: &str = "next_sequence";
+const RECOVERY_TIP_KEY: &str = "recovery_tip";
+const PENDING_CANDIDATE_KEY: &str = "pending_candidate";
+
+/// Default ceiling on persisted non-genesis entries before DAG materialization.
+/// This is an entry-count safety limit, not a measured process-RSS guarantee.
+/// Offline callers can supply a reviewed allowance through load_dag_with_limit.
+pub const DEFAULT_MAX_REPLAY_HEADERS: usize = crate::headers::DEFAULT_MAX_RETAINED_HEADERS;
 
 #[cfg(test)]
 thread_local! {
@@ -33,6 +44,12 @@ thread_local! {
 /// Failures from header persistence and replay.
 #[derive(Debug, Error)]
 pub enum HeaderStoreError {
+    /// A complete candidate journal must finish promotion before exposing a chain.
+    #[error("unfinished header candidate promotion; resume node recovery")]
+    PendingCandidate,
+    /// Disk candidate validation or local resource deferral.
+    #[error("header candidate: {0}")]
+    Candidate(#[from] crate::header_candidate::HeaderCandidateError),
     /// Database open/create failed.
     #[error("redb database: {0}")]
     Database(#[from] redb::DatabaseError),
@@ -81,10 +98,20 @@ pub struct RedbHeaderStore {
     write_guard: Mutex<()>,
 }
 
+mod candidate;
+mod replay;
+pub use replay::HeaderReplayReader;
+
 impl RedbHeaderStore {
     /// Opens or creates a header database at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, HeaderStoreError> {
-        let db = Database::create(path)?;
+        let path = path.as_ref();
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let db =
+            crate::header_storage_budget::open(path, directory, HEADER_STORE_CACHE_BYTES, false)?;
         let transaction = db.begin_write()?;
         {
             let _headers = transaction.open_table(HEADERS)?;
@@ -114,7 +141,114 @@ impl RedbHeaderStore {
     /// A duplicate or malformed header aborts the complete batch, leaving the
     /// durable prefix unchanged.
     pub fn append_batch(&self, batch: &[Header]) -> Result<(), HeaderStoreError> {
-        if batch.is_empty() {
+        self.append_batch_with_cursor(batch, None)
+    }
+
+    /// Atomically persists validated headers and the next recovery locator tip.
+    /// The tip must be a persisted non-genesis header, including one in `batch`.
+    /// An empty batch checkpoints an already validated, retained prefix.
+    pub fn append_recovery_batch(
+        &self,
+        batch: &[Header],
+        tip: BlockHash,
+    ) -> Result<(), HeaderStoreError> {
+        self.append_batch_with_cursor(batch, Some(tip))
+    }
+
+    /// Returns the durable recovery hint, never a trusted consensus checkpoint.
+    /// Callers must replay validation and resolve it in their DAG before use.
+    pub fn recovery_tip(&self) -> Result<Option<BlockHash>, HeaderStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        let value = meta.get(RECOVERY_TIP_KEY)?;
+        value
+            .map(|value| {
+                let bytes = value
+                    .value()
+                    .try_into()
+                    .map_err(|_| HeaderStoreError::Malformed("header recovery tip encoding"))?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .transpose()
+    }
+
+    /// Returns the candidate whose raw records may be only partially imported.
+    pub fn pending_candidate_tip(&self) -> Result<Option<BlockHash>, HeaderStoreError> {
+        let transaction = self.db.begin_read()?;
+        let meta = transaction.open_table(META)?;
+        meta.get(PENDING_CANDIDATE_KEY)?
+            .map(|value| {
+                let bytes = value
+                    .value()
+                    .try_into()
+                    .map_err(|_| HeaderStoreError::Malformed("pending candidate hash"))?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .transpose()
+    }
+
+    /// Pins promotion intent before importing its first bounded batch. Readers
+    /// that materialize a selected DAG refuse an unfinished promotion.
+    pub fn begin_candidate_promotion(&self, tip: BlockHash) -> Result<(), HeaderStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            if meta
+                .get(PENDING_CANDIDATE_KEY)?
+                .is_some_and(|value| value.value() != tip.as_byte_array())
+            {
+                return Err(HeaderStoreError::PendingCandidate);
+            }
+            meta.insert(PENDING_CANDIDATE_KEY, tip.as_byte_array().as_slice())?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Makes the completely imported candidate eligible for selected-chain
+    /// reconstruction. The caller must first revalidate and verify its full tip.
+    pub fn finish_candidate_promotion(&self, tip: BlockHash) -> Result<(), HeaderStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        {
+            let mut meta = transaction.open_table(META)?;
+            if meta
+                .get(PENDING_CANDIDATE_KEY)?
+                .is_none_or(|value| value.value() != tip.as_byte_array())
+            {
+                return Err(HeaderStoreError::PendingCandidate);
+            }
+            if transaction
+                .open_table(HEADERS)?
+                .get(tip.as_byte_array().as_slice())?
+                .is_none()
+            {
+                return Err(HeaderStoreError::Malformed(
+                    "candidate tip not fully imported",
+                ));
+            }
+            meta.remove(PENDING_CANDIDATE_KEY)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Clears a completed recovery hint without changing any retained headers.
+    pub fn clear_recovery_tip(&self) -> Result<(), HeaderStoreError> {
+        let _guard = self.lock();
+        let transaction = self.db.begin_write()?;
+        transaction.open_table(META)?.remove(RECOVERY_TIP_KEY)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn append_batch_with_cursor(
+        &self,
+        batch: &[Header],
+        tip: Option<BlockHash>,
+    ) -> Result<(), HeaderStoreError> {
+        if batch.is_empty() && tip.is_none() {
             return Ok(());
         }
         let _guard = self.lock();
@@ -147,6 +281,13 @@ impl RedbHeaderStore {
                     .ok_or(HeaderStoreError::Malformed("header sequence overflow"))?;
             }
             meta.insert(NEXT_SEQUENCE_KEY, sequence.to_le_bytes().as_slice())?;
+            if let Some(tip) = tip {
+                let bytes = tip.to_byte_array();
+                if headers.get(bytes.as_slice())?.is_none() {
+                    return Err(HeaderStoreError::Malformed("unretained recovery tip"));
+                }
+                meta.insert(RECOVERY_TIP_KEY, bytes.as_slice())?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -172,7 +313,14 @@ impl RedbHeaderStore {
         &self,
         stage: &StagedHeaderEviction<'_>,
     ) -> Result<(), HeaderStoreError> {
-        if stage.evicted().is_empty() {
+        self.persist_eviction_records(stage.evicted())
+    }
+
+    pub(crate) fn persist_eviction_records(
+        &self,
+        evicted: &[crate::headers::HeaderInfo],
+    ) -> Result<(), HeaderStoreError> {
+        if evicted.is_empty() {
             return Ok(());
         }
         let _guard = self.lock();
@@ -181,13 +329,14 @@ impl RedbHeaderStore {
             let mut headers = transaction.open_table(HEADERS)?;
             let mut order = transaction.open_table(INSERTION_ORDER)?;
             let mut reverse = transaction.open_table(HASH_SEQUENCE)?;
+            let mut meta = transaction.open_table(META)?;
             if reverse.len()? != order.len()? {
                 for row in order.iter()? {
                     let (sequence, hash) = row?;
                     reverse.insert(hash.value(), sequence.value())?;
                 }
             }
-            for info in stage.evicted() {
+            for info in evicted {
                 let hash = info.hash.to_byte_array();
                 let sequence = reverse
                     .get(hash.as_slice())?
@@ -212,6 +361,12 @@ impl RedbHeaderStore {
                 headers.remove(hash.as_slice())?;
                 order.remove(sequence)?;
                 reverse.remove(hash.as_slice())?;
+                let removes_cursor = meta
+                    .get(RECOVERY_TIP_KEY)?
+                    .is_some_and(|cursor| cursor.value() == hash);
+                if removes_cursor {
+                    meta.remove(RECOVERY_TIP_KEY)?;
+                }
             }
         }
         transaction.commit()?;
@@ -243,7 +398,7 @@ impl RedbHeaderStore {
         deployments: DeploymentConfig,
         adjusted_time: u32,
     ) -> Result<HeaderDag, HeaderStoreError> {
-        self.load_dag_with_limit(deployments, adjusted_time, usize::MAX)
+        self.load_dag_with_limit(deployments, adjusted_time, DEFAULT_MAX_REPLAY_HEADERS)
     }
 
     /// Checks retained row count before materializing any historical DAG entries.
@@ -258,6 +413,13 @@ impl RedbHeaderStore {
         max_headers: usize,
     ) -> Result<HeaderDag, HeaderStoreError> {
         let transaction = self.db.begin_read()?;
+        if transaction
+            .open_table(META)?
+            .get(PENDING_CANDIDATE_KEY)?
+            .is_some()
+        {
+            return Err(HeaderStoreError::PendingCandidate);
+        }
         let order = transaction.open_table(INSERTION_ORDER)?;
         let headers = transaction.open_table(HEADERS)?;
         let retained = headers.len()?;

@@ -101,6 +101,34 @@ fn many_inputs_transaction(inputs: u16) -> Transaction {
 }
 
 #[test]
+fn indexed_measures_match_relay_and_withhold_stale_chain_values() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, transaction) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+    let txid = transaction.compute_txid();
+    let mut pool = TransactionAdmissionPool::default();
+    pool.admit(&store, transaction, context()).unwrap();
+    let relay = pool.relay_snapshot();
+    let before = pool.admission_budget().snapshot().charged;
+    assert_eq!(
+        pool.validated_measures(txid),
+        Some((relay[0].policy_vsize, relay[0].fee_sats))
+    );
+    assert_eq!(
+        pool.validated_measures(Txid::from_byte_array([99; 32])),
+        None
+    );
+    assert_eq!(pool.admission_budget().snapshot().charged, before);
+    pool.require_revalidation(BlockHash::from_byte_array([42; 32]));
+    assert_eq!(pool.validated_measures(txid), None);
+    pool.reconcile(&store, context()).unwrap();
+    assert_eq!(
+        pool.validated_measures(txid),
+        Some((relay[0].policy_vsize, relay[0].fee_sats))
+    );
+}
+
+#[test]
 fn rejection_and_pool_clones_cannot_reset_the_shared_allowance() {
     let (_directory, store) = store();
     let (_, _, tx) = spend(1);
@@ -467,4 +495,40 @@ fn single_transaction_lookups_do_not_clone_the_pool() {
     let (_, _, absent) = spend(2);
     assert_eq!(pool.transaction(absent.compute_txid()), None);
     assert_eq!(pool.transaction_by_wtxid(absent.compute_wtxid()), None);
+}
+
+#[test]
+fn prevout_materialization_is_reserved_before_lookup_and_overlay_delta_is_retained() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, transaction) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+
+    let required = transaction_materialization_reservation_bytes(&transaction);
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: 1_000_000,
+        work_per_second: 0,
+        candidate_bytes: required.saturating_sub(1),
+    });
+    let overlay = AdmissionUtxoOverlay::new(&store, &budget);
+    let error = match apply_to_overlay(&overlay, &transaction, context(), 0, None) {
+        Ok(_) => panic!("materialization reservation must defer before lookup"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        TransactionAdmissionError::ResourceDeferred(_)
+    ));
+    assert_eq!(budget.snapshot().candidate_bytes, 0);
+    assert!(overlay.get(outpoint.into()).unwrap().is_some());
+
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: 1_000_000,
+        work_per_second: 0,
+        candidate_bytes: required + 1_024,
+    });
+    let overlay = AdmissionUtxoOverlay::new(&store, &budget);
+    apply_to_overlay(&overlay, &transaction, context(), 0, None).unwrap();
+    assert!(budget.snapshot().candidate_bytes > 0);
+    drop(overlay);
+    assert_eq!(budget.snapshot().candidate_bytes, 0);
 }

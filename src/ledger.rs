@@ -5,7 +5,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -15,8 +15,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::archive::{
-    ArchiveError, ArchiveManifest, read_archive, read_archive_manifest, verify_archive,
-    verify_archive_block_hashes_streaming, verify_archive_streaming, write_archive,
+    ArchiveBlock, ArchiveBlocks, ArchiveBlocksBuilder, ArchiveError, ArchiveManifest, read_archive,
+    read_archive_manifest, verify_archive, verify_archive_block_hashes_streaming,
+    verify_archive_streaming, write_archive,
 };
 
 const INDEX_FILE: &str = "ledger-index.json";
@@ -114,7 +115,7 @@ pub struct LedgerBlockBatch {
     /// Exact canonical record bytes retained in this batch.
     pub record_bytes: u64,
     /// Consensus-serialized blocks in ascending height order.
-    pub blocks: Vec<Vec<u8>>,
+    pub blocks: ArchiveBlocks,
 }
 
 /// Deterministic manual-prefix prune plan.
@@ -449,7 +450,7 @@ impl PrunedBlockLedger {
     pub fn append(
         &self,
         first_height: u32,
-        blocks: &[Vec<u8>],
+        blocks: &[impl AsRef<[u8]>],
     ) -> Result<ArchiveManifest, LedgerError> {
         let _guard = self.lock();
         self.append_locked(first_height, blocks)
@@ -459,7 +460,7 @@ impl PrunedBlockLedger {
     ///
     /// Only one segment may be staged. It is not visible through retained
     /// reads until [`Self::commit_staged`] publishes its validated prefix.
-    pub fn stage(&self, first_height: u32, blocks: &[Vec<u8>]) -> Result<(), LedgerError> {
+    pub fn stage(&self, first_height: u32, blocks: &[impl AsRef<[u8]>]) -> Result<(), LedgerError> {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty staged segment"));
         }
@@ -485,6 +486,52 @@ impl PrunedBlockLedger {
         self.sync_directory(LedgerSyncPoint::StagedPublish)
     }
 
+    /// Encodes a validated block under this ledger's shared memory allowance.
+    pub(crate) fn serialize_block(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<ArchiveBlock, LedgerError> {
+        Ok(ArchiveBlock::serialize_for_path(&self.root, block)?)
+    }
+
+    /// Verifies a selected batch against an immutable stage before execution.
+    /// The whole archive identity and integrity are checked, including records
+    /// outside this batch. Existing staged bytes are never rewritten here.
+    pub(crate) fn stage_or_verify(
+        &self,
+        first_height: u32,
+        blocks: &[impl AsRef<[u8]>],
+        expected: Option<&ArchiveManifest>,
+    ) -> Result<(), LedgerError> {
+        let Some(expected) = expected else {
+            return self.stage(first_height, blocks);
+        };
+        let count = u32::try_from(blocks.len())
+            .map_err(|_| LedgerError::Invalid("staged batch count overflow"))?;
+        if count == 0 {
+            return Err(LedgerError::Invalid("empty staged reuse"));
+        }
+        let _guard = self.lock();
+        let mut position = 0;
+        let matches = crate::archive::visit_archive_range(
+            self.staged_path(),
+            expected,
+            first_height,
+            count,
+            &mut |_, raw| {
+                let same = blocks
+                    .get(position)
+                    .is_some_and(|block| block.as_ref() == raw);
+                position += 1;
+                same
+            },
+        )?;
+        if !matches || position != blocks.len() {
+            return Err(LedgerError::Invalid("staged reuse payload changed"));
+        }
+        Ok(())
+    }
+
     /// Returns the checksum-verified segment awaiting publication, if any.
     pub fn staged(&self) -> Result<Option<StagedSegment>, LedgerError> {
         let _guard = self.lock();
@@ -495,6 +542,82 @@ impl PrunedBlockLedger {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Fully verifies staged data without materializing its block payloads.
+    pub fn staged_manifest(&self) -> Result<Option<ArchiveManifest>, LedgerError> {
+        let _guard = self.lock();
+        match verify_archive_streaming(self.staged_path()) {
+            Ok(manifest) => Ok(Some(manifest)),
+            Err(ArchiveError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Validates a staged prefix in one bounded-memory record traversal.
+    /// The callback must not publish state: success is returned only after the
+    /// entire archive's framing and record digest are checked. A false callback
+    /// stops further callbacks but the remaining records are still verified.
+    pub(crate) fn visit_staged_prefix(
+        &self,
+        expected: &ArchiveManifest,
+        count: u32,
+        visit: &mut dyn FnMut(u32, &[u8]) -> bool,
+    ) -> Result<bool, LedgerError> {
+        let _guard = self.lock();
+        crate::archive::visit_archive_prefix(self.staged_path(), expected, count, visit)
+            .map_err(Into::into)
+    }
+
+    /// Reads a bounded contiguous part of a previously verified staged segment.
+    /// The complete identity must still match `expected`. This never publishes,
+    /// truncates, removes or replaces staged data, even when admission is too
+    /// small for its first requested record. Consensus revalidation remains the
+    /// caller's responsibility before committing any returned prefix.
+    pub fn read_staged_batch(
+        &self,
+        expected: &ArchiveManifest,
+        first_height: u32,
+        max_blocks: u32,
+        max_record_bytes: u64,
+    ) -> Result<LedgerBlockBatch, LedgerError> {
+        if max_blocks == 0
+            || max_blocks > u32::from(MAX_AUDIT_SLOT_NAMESPACE)
+            || max_record_bytes == 0
+            || first_height
+                .checked_sub(expected.first_height)
+                .is_none_or(|offset| offset >= expected.block_count)
+        {
+            return Err(LedgerError::Invalid("invalid staged block batch bound"));
+        }
+        let _guard = self.lock();
+        let (manifest, blocks) = crate::archive::read_archive_batch(
+            self.staged_path(),
+            first_height,
+            max_blocks,
+            max_record_bytes,
+        )?;
+        if &manifest != expected {
+            return Err(LedgerError::Invalid("staged archive identity changed"));
+        }
+        if blocks.is_empty() {
+            return Err(LedgerError::Invalid(
+                "staged block batch byte budget was exhausted",
+            ));
+        }
+        let record_bytes = blocks.iter().try_fold(0_u64, |total, block| {
+            total
+                .checked_add(4)
+                .and_then(|total| total.checked_add(block.len() as u64))
+                .ok_or(LedgerError::Invalid("staged block batch byte overflow"))
+        })?;
+        Ok(LedgerBlockBatch {
+            first_height,
+            record_bytes,
+            blocks,
+        })
     }
 
     /// Publishes the first `block_count` staged blocks and discards the rest.
@@ -521,13 +644,16 @@ impl PrunedBlockLedger {
             if block_count == manifest.block_count {
                 return self.publish_staged_locked(&manifest, index);
             }
-            let (_, blocks) = read_archive(self.staged_path())?;
-            let count = usize::try_from(block_count).expect("staged block count fits usize");
-            self.append_locked(manifest.first_height, &blocks[..count])?;
+            self.append_generated_locked(manifest.first_height, block_count, |temporary| {
+                crate::archive::write_archive_prefix(
+                    &self.staged_path(),
+                    &manifest,
+                    block_count,
+                    temporary,
+                )
+            })?;
         } else if manifest.first_height.checked_add(block_count) == retained_next {
-            let (_, blocks) = read_archive(self.staged_path())?;
-            let count = usize::try_from(block_count).expect("staged block count fits usize");
-            if !self.retained_bytes_match(&index, manifest.first_height, &blocks[..count])? {
+            if !self.retained_bytes_match(&index, &manifest, block_count)? {
                 return Err(LedgerError::Invalid(
                     "staged segment does not extend ledger tip",
                 ));
@@ -539,6 +665,76 @@ impl PrunedBlockLedger {
         }
         fs::remove_file(self.staged_path())?;
         self.sync_directory(LedgerSyncPoint::StagedRemoval)
+    }
+
+    /// Publishes through a caller-validated execution checkpoint while keeping
+    /// the complete immutable stage until its last block has been published.
+    /// `executed_count` is cumulative from `expected.first_height`, not a batch
+    /// size. The caller must establish that these blocks are durably executed.
+    /// Reopening recovers any slot rename before retrying; already published
+    /// retained bytes are compared before continuing or deleting the stage.
+    pub(crate) fn commit_staged_through(
+        &self,
+        expected: &ArchiveManifest,
+        executed_count: u32,
+    ) -> Result<(), LedgerError> {
+        if executed_count == 0 || executed_count > expected.block_count {
+            return Err(LedgerError::Invalid("invalid staged execution checkpoint"));
+        }
+        let _guard = self.lock();
+        if verify_archive_streaming(self.staged_path())? != *expected {
+            return Err(LedgerError::Invalid("staged archive identity changed"));
+        }
+        let end = expected
+            .first_height
+            .checked_add(executed_count)
+            .ok_or(LedgerError::Invalid("height overflow"))?;
+        let index = self.read_index()?;
+        let next = index
+            .segments
+            .last()
+            .map(segment_end_exclusive)
+            .transpose()?
+            .unwrap_or(expected.first_height);
+        if next < expected.first_height || next > end {
+            return Err(LedgerError::Invalid(
+                "staged checkpoint does not extend ledger tip",
+            ));
+        }
+        if next > expected.first_height {
+            // Circular retention may have pruned earlier checkpoints. Compare
+            // every retained overlap, without requiring already-pruned bytes.
+            let first = index
+                .segments
+                .first()
+                .expect("nonempty retained overlap")
+                .first_height
+                .max(expected.first_height);
+            if !self.retained_range_bytes_match(&index, expected, first, next - first)? {
+                return Err(LedgerError::Invalid(
+                    "staged checkpoint differs from retained blocks",
+                ));
+            }
+        }
+        if next == expected.first_height && executed_count == expected.block_count {
+            return self.publish_staged_locked(expected, index);
+        }
+        if next < end {
+            self.append_generated_locked(next, end - next, |temporary| {
+                crate::archive::write_archive_range(
+                    &self.staged_path(),
+                    expected,
+                    next,
+                    end - next,
+                    temporary,
+                )
+            })?;
+        }
+        if executed_count == expected.block_count {
+            fs::remove_file(self.staged_path())?;
+            self.sync_directory(LedgerSyncPoint::StagedRemoval)?;
+        }
+        Ok(())
     }
 
     fn publish_staged_locked(
@@ -583,14 +779,25 @@ impl PrunedBlockLedger {
     fn append_locked(
         &self,
         first_height: u32,
-        blocks: &[Vec<u8>],
+        blocks: &[impl AsRef<[u8]>],
     ) -> Result<ArchiveManifest, LedgerError> {
         if blocks.is_empty() {
             return Err(LedgerError::Invalid("empty segment"));
         }
-        let mut index = self.read_index()?;
         let block_count =
             u32::try_from(blocks.len()).map_err(|_| LedgerError::Invalid("too many blocks"))?;
+        self.append_generated_locked(first_height, block_count, |temporary| {
+            write_archive(temporary, first_height, blocks)
+        })
+    }
+
+    fn append_generated_locked(
+        &self,
+        first_height: u32,
+        block_count: u32,
+        generate: impl FnOnce(&Path) -> Result<ArchiveManifest, ArchiveError>,
+    ) -> Result<ArchiveManifest, LedgerError> {
+        let mut index = self.read_index()?;
         if block_count > self.retention.max_blocks {
             return Err(LedgerError::Invalid(
                 "single segment exceeds maximum blocks",
@@ -610,7 +817,7 @@ impl PrunedBlockLedger {
         index.segments.retain(|segment| segment.slot != slot);
         let destination = self.slot_path(slot);
         let temporary = destination.with_extension("rblk.new");
-        let manifest = write_archive(&temporary, first_height, blocks)?;
+        let manifest = generate(&temporary)?;
         let bytes = fs::metadata(&temporary)?.len();
         if bytes > self.retention.max_bytes {
             fs::remove_file(temporary)?;
@@ -690,6 +897,12 @@ impl PrunedBlockLedger {
     /// The complete containing archive is checksum-verified before the block
     /// is returned. A pruned or not-yet-appended height returns `None`.
     pub fn read_block(&self, height: u32) -> Result<Option<Vec<u8>>, LedgerError> {
+        self.read_owned_block(height)
+            .map(|block| block.map(|bytes| bytes.to_vec()))
+    }
+
+    /// Reads one immutable block, retaining admission through its final alias.
+    pub fn read_owned_block(&self, height: u32) -> Result<Option<ArchiveBlock>, LedgerError> {
         let _guard = self.lock();
         let index = self.read_index()?;
         self.read_block_from_index(&index, height)
@@ -793,7 +1006,10 @@ impl PrunedBlockLedger {
         let index = self.read_index()?;
         let mut next_height = first_height;
         let mut record_bytes = 0_u64;
-        let mut blocks = Vec::with_capacity(usize::try_from(max_blocks).expect("u32 fits usize"));
+        let mut blocks = ArchiveBlocksBuilder::new(
+            &self.root,
+            usize::try_from(max_blocks).expect("u32 fits usize"),
+        )?;
         for segment in &index.segments {
             let segment_end = segment_end_inclusive(segment)?;
             if segment_end < next_height {
@@ -802,15 +1018,30 @@ impl PrunedBlockLedger {
             if segment.first_height > next_height {
                 break;
             }
-            let (manifest, segment_blocks) = read_archive(self.slot_path(segment.slot))?;
+            let remaining_bytes = max_record_bytes.saturating_sub(record_bytes);
+            if remaining_bytes == 0 {
+                break;
+            }
+            let (manifest, segment_blocks) = crate::archive::read_archive_batch(
+                self.slot_path(segment.slot),
+                next_height,
+                max_blocks - u32::try_from(blocks.len()).expect("bounded batch length fits u32"),
+                remaining_bytes,
+            )?;
             if manifest.first_height != segment.first_height
                 || manifest.block_count != segment.block_count
             {
                 return Err(LedgerError::Invalid("archive does not match ledger index"));
             }
-            let offset = usize::try_from(next_height - segment.first_height)
-                .expect("archive offset fits usize");
-            for block in segment_blocks.into_iter().skip(offset) {
+            if segment_blocks.is_empty() {
+                if blocks.is_empty() {
+                    return Err(LedgerError::Invalid(
+                        "retained block batch byte budget was exhausted",
+                    ));
+                }
+                break;
+            }
+            for block in segment_blocks {
                 let next_record_bytes = record_bytes
                     .checked_add(4)
                     .and_then(|bytes| {
@@ -827,11 +1058,11 @@ impl PrunedBlockLedger {
                     return Ok(LedgerBlockBatch {
                         first_height,
                         record_bytes,
-                        blocks,
+                        blocks: blocks.finish(),
                     });
                 }
                 record_bytes = next_record_bytes;
-                blocks.push(block);
+                blocks.push(block)?;
                 next_height = next_height
                     .checked_add(1)
                     .ok_or(LedgerError::Invalid("height overflow"))?;
@@ -839,7 +1070,7 @@ impl PrunedBlockLedger {
                     return Ok(LedgerBlockBatch {
                         first_height,
                         record_bytes,
-                        blocks,
+                        blocks: blocks.finish(),
                     });
                 }
             }
@@ -852,7 +1083,7 @@ impl PrunedBlockLedger {
         Ok(LedgerBlockBatch {
             first_height,
             record_bytes,
-            blocks,
+            blocks: blocks.finish(),
         })
     }
 
@@ -1207,12 +1438,9 @@ impl PrunedBlockLedger {
             if manifest.first_height >= height {
                 fs::remove_file(path)?;
             } else if end > height {
-                let (_, mut blocks) = read_archive(&path)?;
-                let keep = usize::try_from(height - manifest.first_height)
-                    .expect("retained block count fits usize");
-                blocks.truncate(keep);
+                let keep = height - manifest.first_height;
                 let temporary = path.with_extension("rblk.truncate");
-                write_archive(&temporary, manifest.first_height, &blocks)?;
+                crate::archive::write_archive_prefix(&path, &manifest, keep, &temporary)?;
                 self.sync(LedgerSyncPoint::TruncateArchive, &temporary)?;
                 fs::rename(temporary, path)?;
             }
@@ -1233,28 +1461,128 @@ impl PrunedBlockLedger {
     fn retained_bytes_match(
         &self,
         index: &LedgerIndex,
-        first_height: u32,
-        expected: &[Vec<u8>],
+        expected: &ArchiveManifest,
+        count: u32,
     ) -> Result<bool, LedgerError> {
-        for (offset, expected) in expected.iter().enumerate() {
-            let height = first_height
-                .checked_add(u32::try_from(offset).expect("staged block offset fits u32"))
-                .ok_or(LedgerError::Invalid("height overflow"))?;
-            let Some(actual) = self.read_block_from_index(index, height)? else {
-                return Ok(false);
-            };
-            if actual != *expected {
+        self.retained_range_bytes_match(index, expected, expected.first_height, count)
+    }
+
+    fn retained_range_bytes_match(
+        &self,
+        index: &LedgerIndex,
+        expected: &ArchiveManifest,
+        first_height: u32,
+        count: u32,
+    ) -> Result<bool, LedgerError> {
+        if count == 0
+            || first_height
+                .checked_sub(expected.first_height)
+                .and_then(|offset| offset.checked_add(count))
+                .is_none_or(|end| end > expected.block_count)
+        {
+            return Err(LedgerError::Invalid("invalid staged comparison count"));
+        }
+        let _spool = crate::node_memory::for_path(&self.staged_path())?
+            .map(|budget| {
+                budget
+                    .reserve_spool(crate::archive::MAX_RECORDS_BYTES)
+                    .map_err(ArchiveError::ResourceBudget)
+            })
+            .transpose()?;
+        let mut records = tempfile::tempfile_in(&self.root)?;
+        let mut failure = None;
+        crate::archive::visit_archive_range(
+            self.staged_path(),
+            expected,
+            first_height,
+            count,
+            &mut |_, raw| {
+                let length = u32::try_from(raw.len())
+                    .expect("verified block size")
+                    .to_le_bytes();
+                if let Err(error) = records
+                    .write_all(&length)
+                    .and_then(|()| records.write_all(raw))
+                {
+                    failure = Some(error);
+                    return false;
+                }
+                true
+            },
+        )?;
+        if let Some(error) = failure {
+            return Err(error.into());
+        }
+        // The scanner rejects more than MAX_RECORDS_BYTES before invoking a
+        // callback, so this scratch file cannot exceed its pre-admitted bound.
+        records.seek(SeekFrom::Start(0))?;
+        let last = first_height
+            .checked_add(count - 1)
+            .ok_or(LedgerError::Invalid("height overflow"))?;
+        let mut matched = 0_u32;
+        let mut same = true;
+        let _scratch_memory = crate::node_memory::for_path(&self.staged_path())?
+            .map(|budget| {
+                budget
+                    .reserve(64 * 1024)
+                    .map_err(ArchiveError::ResourceBudget)
+            })
+            .transpose()?;
+        let mut scratch = vec![0_u8; 64 * 1024].into_boxed_slice();
+        for segment in &index.segments {
+            if segment_end_inclusive(segment)? < first_height || segment.first_height > last {
+                continue;
+            }
+            let path = self.slot_path(segment.slot);
+            let manifest = read_archive_manifest(&path)?;
+            if manifest.first_height != segment.first_height
+                || manifest.block_count != segment.block_count
+            {
+                return Err(LedgerError::Invalid("archive does not match ledger index"));
+            }
+            let start = first_height.max(segment.first_height);
+            let count = last.min(segment_end_inclusive(segment)?) - start + 1;
+            crate::archive::visit_archive_range(
+                &path,
+                &manifest,
+                start,
+                count,
+                &mut |height, raw| {
+                    if first_height.checked_add(matched) != Some(height) {
+                        same = false;
+                        return false;
+                    }
+                    match compare_spooled_record(&mut records, raw, &mut scratch) {
+                        Ok(true) => {
+                            matched += 1;
+                            true
+                        }
+                        Ok(false) => {
+                            same = false;
+                            false
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            false
+                        }
+                    }
+                },
+            )?;
+            if let Some(error) = failure {
+                return Err(error.into());
+            }
+            if !same {
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(matched == count)
     }
 
     fn read_block_from_index(
         &self,
         index: &LedgerIndex,
         height: u32,
-    ) -> Result<Option<Vec<u8>>, LedgerError> {
+    ) -> Result<Option<ArchiveBlock>, LedgerError> {
         let Some(segment) = index
             .segments
             .iter()
@@ -1262,20 +1590,44 @@ impl PrunedBlockLedger {
         else {
             return Ok(None);
         };
-        let (manifest, blocks) = read_archive(self.slot_path(segment.slot))?;
+        let (manifest, blocks) = crate::archive::read_archive_batch(
+            self.slot_path(segment.slot),
+            height,
+            1,
+            crate::archive::MAX_RECORDS_BYTES,
+        )?;
         if manifest.first_height != segment.first_height
             || manifest.block_count != segment.block_count
         {
             return Err(LedgerError::Invalid("archive does not match ledger index"));
         }
-        let offset = usize::try_from(height - segment.first_height)
-            .expect("archive block offset fits usize");
         blocks
-            .get(offset)
-            .cloned()
+            .into_iter()
+            .next()
             .map(Some)
             .ok_or(LedgerError::Invalid("archive block missing"))
     }
+}
+
+// Compare framing and bytes directly; no per-record hashes or large decoded
+// comparison buffer substitute for the original byte equality check.
+fn compare_spooled_record(
+    records: &mut File,
+    actual: &[u8],
+    scratch: &mut [u8],
+) -> io::Result<bool> {
+    let mut length = [0_u8; 4];
+    records.read_exact(&mut length)?;
+    if u32::from_le_bytes(length) as usize != actual.len() {
+        return Ok(false);
+    }
+    for chunk in actual.chunks(scratch.len()) {
+        records.read_exact(&mut scratch[..chunk.len()])?;
+        if &scratch[..chunk.len()] != chunk {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_read_only_plan_index(
@@ -2427,6 +2779,39 @@ mod tests {
     }
 
     #[test]
+    fn streamed_truncation_resumes_after_temporary_disk_admission_failure() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 10,
+            max_bytes: 1_000_000,
+            slots: 3,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        let blocks = [vec![10; 70_000], vec![11; 80_000], vec![12; 90_000]];
+        ledger.append(10, &blocks).unwrap();
+        ledger.append(13, &[vec![13], vec![14]]).unwrap();
+        let old_bytes = fs::read(ledger.slot_path(0)).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
+        assert!(ledger.truncate_from(12).is_err());
+        assert_eq!(fs::read(ledger.slot_path(0)).unwrap(), old_bytes);
+        assert!(ledger.truncate_path().exists());
+        assert!(!ledger.slot_path(0).with_extension("rblk.truncate").exists());
+        drop(ledger);
+        assert!(PrunedBlockLedger::open(dir.path(), retention).is_err());
+        drop(pressure);
+        let recovered = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        assert_eq!(recovered.retained_ranges().unwrap(), vec![(10, 11)]);
+        assert_eq!(recovered.read_block(11).unwrap(), Some(blocks[1].clone()));
+        assert!(recovered.read_block(12).unwrap().is_none());
+        assert!(!recovered.truncate_path().exists());
+        assert_eq!(budget.spool_snapshot().used, 0);
+        recovered.append(12, &[vec![42]]).unwrap();
+        assert_eq!(recovered.read_block(12).unwrap(), Some(vec![42]));
+    }
+
+    #[test]
     fn resumes_an_interrupted_truncation_intent_on_open() {
         let dir = TempDir::new().unwrap();
         let retention = LedgerRetention {
@@ -2565,6 +2950,39 @@ mod tests {
     }
 
     #[test]
+    fn shared_batch_arrays_hold_admission_across_segment_merge_and_partial_iteration() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.append(1, &[vec![1; 20], vec![2; 30]]).unwrap();
+        ledger.append(3, &[vec![3; 40]]).unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve(budget.snapshot().limit - 1).unwrap();
+        assert!(matches!(
+            ledger.read_block_batch(1, 3, 1_000),
+            Err(LedgerError::Archive(ArchiveError::ResourceBudget(_)))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - 1);
+        drop(pressure);
+        let batch = ledger.read_block_batch(1, 3, 1_000).unwrap();
+        assert_eq!(batch.blocks, vec![vec![1; 20], vec![2; 30], vec![3; 40]]);
+        let used = budget.snapshot().used;
+        let alias = batch.clone();
+        assert_eq!(batch.blocks.as_ptr(), alias.blocks.as_ptr());
+        assert_eq!(budget.snapshot().used, used);
+        let mut iterator = batch.blocks.into_iter();
+        let escaped = iterator.next().unwrap();
+        drop(alias);
+        assert_eq!(budget.snapshot().used, used);
+        drop(iterator);
+        assert!(budget.snapshot().used > 0 && budget.snapshot().used < used);
+        assert_eq!(escaped.as_ref(), &[1; 20]);
+        drop(escaped);
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(1, 2), (3, 3)]);
+    }
+
+    #[test]
     fn reads_bounded_contiguous_batches_across_archive_boundaries() {
         let dir = TempDir::new().unwrap();
         let retention = LedgerRetention {
@@ -2588,6 +3006,105 @@ mod tests {
             ))
         ));
         assert!(ledger.read_block_batch(9, 1, 100).is_err());
+    }
+
+    #[test]
+    fn bounded_staged_reads_preserve_durable_data_and_reject_identity_changes() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        let blocks = [vec![10], vec![11; 256 * 1024], vec![12]];
+        ledger.stage(10, &blocks).unwrap();
+        let original = fs::read(ledger.staged_path()).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        assert!(ledger.read_staged_batch(&identity, 10, 2, 4).is_err());
+        let prefix = ledger.read_staged_batch(&identity, 10, 2, 5).unwrap();
+        assert_eq!(prefix.blocks, vec![vec![10]]);
+        assert_eq!(prefix.record_bytes, 5);
+        assert!(ledger.read_staged_batch(&identity, 11, 2, 5).is_err());
+        assert_eq!(
+            ledger
+                .read_staged_batch(&identity, 12, 1, 5)
+                .unwrap()
+                .blocks,
+            vec![vec![12]]
+        );
+        assert!(ledger.read_staged_batch(&identity, 9, 1, 5).is_err());
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        assert!(ledger.read_block(10).unwrap().is_none());
+        assert!(ledger.read_block_batch(10, 1, 5).is_err());
+        drop(ledger);
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+        assert_eq!(
+            ledger
+                .read_staged_batch(&identity, 10, 3, 300_000)
+                .unwrap()
+                .blocks,
+            blocks
+        );
+        ledger.discard_staged().unwrap();
+        ledger.stage(10, &[vec![99]]).unwrap();
+        assert!(matches!(
+            ledger.read_staged_batch(&identity, 10, 1, 5),
+            Err(LedgerError::Invalid("staged archive identity changed"))
+        ));
+        let replacement = ledger.staged_manifest().unwrap().unwrap();
+        assert_eq!(
+            ledger
+                .read_staged_batch(&replacement, 10, 1, 5)
+                .unwrap()
+                .blocks,
+            vec![vec![99]]
+        );
+        assert!(ledger.retained_tip().unwrap().is_none());
+        ledger.commit_staged(1).unwrap();
+        assert_eq!(ledger.read_block(10).unwrap(), Some(vec![99]));
+    }
+
+    #[test]
+    fn published_prefix_comparison_streams_across_slots_and_preserves_failed_stage() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        let first = vec![1; 70_000];
+        let second = vec![2; 80_000];
+        let third = vec![3; 90_000];
+        ledger.append(10, &[vec![0], first.clone()]).unwrap();
+        ledger.append(12, &[second.clone(), third.clone()]).unwrap();
+        let blocks = [first, second, third, vec![4]];
+        ledger.stage(11, &blocks).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(16 * 1024 * 1024);
+        budget.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = budget.reserve_spool(budget.spool_snapshot().limit).unwrap();
+        assert!(ledger.commit_staged(3).is_err());
+        assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+        assert_eq!(ledger.retained_tip().unwrap(), Some(13));
+        drop(pressure);
+        ledger.commit_staged(3).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert_eq!(ledger.read_block(12).unwrap(), Some(blocks[1].clone()));
+        for change_length in [false, true] {
+            let mut wrong = blocks.clone();
+            if change_length {
+                wrong[1].push(7);
+            } else {
+                wrong[1][70_000] ^= 1;
+            }
+            ledger.stage(11, &wrong).unwrap();
+            let identity = ledger.staged_manifest().unwrap().unwrap();
+            assert!(matches!(
+                ledger.commit_staged(3),
+                Err(LedgerError::Invalid(
+                    "staged segment does not extend ledger tip"
+                ))
+            ));
+            assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
+            assert_eq!(ledger.retained_tip().unwrap(), Some(13));
+            assert_eq!(budget.spool_snapshot().used, 0);
+            ledger.discard_staged().unwrap();
+        }
     }
 
     #[test]
@@ -2668,6 +3185,141 @@ mod tests {
         assert!(recovered.staged().unwrap().is_none());
         assert_eq!(recovered.read_block(12).unwrap(), Some(vec![12]));
         assert_eq!(recovered.read_block(13).unwrap(), None);
+    }
+
+    #[test]
+    fn staged_checkpoints_keep_source_until_final_publication_and_tolerate_pruning() {
+        let dir = TempDir::new().unwrap();
+        let retention = LedgerRetention {
+            max_blocks: 3,
+            max_bytes: 1_000_000,
+            slots: 1,
+        };
+        let ledger = PrunedBlockLedger::open(dir.path(), retention).unwrap();
+        ledger.stage(10, &[vec![10], vec![11], vec![12]]).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let original = fs::read(ledger.staged_path()).unwrap();
+        for count in 1..=2 {
+            ledger.commit_staged_through(&identity, count).unwrap();
+            ledger.commit_staged_through(&identity, count).unwrap();
+            assert_eq!(ledger.retained_tip().unwrap(), Some(9 + count));
+            assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        }
+        assert!(ledger.read_block(10).unwrap().is_none());
+        drop(ledger);
+        let ledger = PrunedBlockLedger::open_persisted(dir.path()).unwrap();
+        ledger.commit_staged_through(&identity, 3).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        assert_eq!(ledger.retained_ranges().unwrap(), vec![(12, 12)]);
+        assert_eq!(ledger.read_block(12).unwrap(), Some(vec![12]));
+    }
+
+    #[test]
+    fn staged_checkpoint_publication_recovers_each_durability_boundary() {
+        for count in [2, 3] {
+            for point in [
+                LedgerSyncPoint::SlotArchive,
+                LedgerSyncPoint::SlotPublish,
+                LedgerSyncPoint::IndexFile,
+                LedgerSyncPoint::IndexPublish,
+                LedgerSyncPoint::StagedRemoval,
+            ] {
+                if count == 2 && point == LedgerSyncPoint::StagedRemoval {
+                    continue;
+                }
+                let dir = TempDir::new().unwrap();
+                let retention = LedgerRetention {
+                    max_blocks: 3,
+                    max_bytes: 1_000_000,
+                    slots: 1,
+                };
+                let durability = Arc::new(FailOnceDurability::new(point));
+                let ledger = PrunedBlockLedger::open_with_durability(
+                    dir.path(),
+                    retention,
+                    durability.clone(),
+                )
+                .unwrap();
+                ledger.stage(10, &[vec![10], vec![11], vec![12]]).unwrap();
+                let identity = ledger.staged_manifest().unwrap().unwrap();
+                let original = fs::read(ledger.staged_path()).unwrap();
+                ledger.commit_staged_through(&identity, 1).unwrap();
+                durability.arm();
+                assert!(
+                    ledger.commit_staged_through(&identity, count).is_err(),
+                    "{point:?}"
+                );
+                assert!(durability.did_fail());
+                if point != LedgerSyncPoint::StagedRemoval {
+                    assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+                }
+                drop(ledger);
+                let ledger = PrunedBlockLedger::open_persisted(dir.path()).unwrap();
+                if ledger.staged_manifest().unwrap().is_some() {
+                    ledger.commit_staged_through(&identity, count).unwrap();
+                }
+                assert_eq!(ledger.retained_tip().unwrap(), Some(9 + count));
+                if count == 2 {
+                    assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+                    assert!(ledger.read_block(12).unwrap().is_none());
+                    ledger.commit_staged_through(&identity, 3).unwrap();
+                }
+                assert!(ledger.staged_manifest().unwrap().is_none());
+                assert_eq!(ledger.read_block(12).unwrap(), Some(vec![12]));
+            }
+        }
+    }
+
+    #[test]
+    fn staged_checkpoint_rejects_replacement_and_conflicting_retained_bytes() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.stage(10, &[vec![10], vec![11]]).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let original = fs::read(ledger.staged_path()).unwrap();
+        for count in [0, 3, u32::MAX] {
+            assert!(ledger.commit_staged_through(&identity, count).is_err());
+        }
+        ledger.append(10, &[vec![99]]).unwrap();
+        assert!(ledger.commit_staged_through(&identity, 2).is_err());
+        assert_eq!(ledger.read_block(10).unwrap(), Some(vec![99]));
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        ledger.discard_staged().unwrap();
+        ledger.stage(10, &[vec![99], vec![12]]).unwrap();
+        let changed = fs::read(ledger.staged_path()).unwrap();
+        assert!(ledger.commit_staged_through(&identity, 2).is_err());
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), changed);
+        assert_eq!(ledger.retained_tip().unwrap(), Some(10));
+    }
+
+    #[test]
+    fn staged_checkpoint_budget_denials_preserve_execution_source_and_publication() {
+        let dir = TempDir::new().unwrap();
+        let ledger = PrunedBlockLedger::open(dir.path(), LedgerRetention::default()).unwrap();
+        ledger.stage(10, &[vec![10], vec![11]]).unwrap();
+        let identity = ledger.staged_manifest().unwrap().unwrap();
+        let original = fs::read(ledger.staged_path()).unwrap();
+        let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
+        memory.bind(&[dir.path().to_path_buf()]).unwrap();
+        let pressure = memory.reserve(memory.snapshot().limit).unwrap();
+        assert!(ledger.commit_staged_through(&identity, 1).is_err());
+        drop(pressure);
+        assert_eq!(memory.snapshot().used, 0);
+        assert!(ledger.retained_tip().unwrap().is_none());
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        ledger.commit_staged_through(&identity, 1).unwrap();
+        let pressure = memory.reserve_spool(memory.spool_snapshot().limit).unwrap();
+        assert!(ledger.commit_staged_through(&identity, 2).is_err());
+        assert_eq!(ledger.retained_tip().unwrap(), Some(10));
+        assert_eq!(fs::read(ledger.staged_path()).unwrap(), original);
+        drop(pressure);
+        assert_eq!(memory.snapshot().used, 0);
+        assert_eq!(memory.spool_snapshot().used, 0);
+        ledger.commit_staged_through(&identity, 2).unwrap();
+        assert!(ledger.staged_manifest().unwrap().is_none());
+        assert_eq!(ledger.read_block(11).unwrap(), Some(vec![11]));
+        assert_eq!(memory.snapshot().used, 0);
+        assert_eq!(memory.spool_snapshot().used, 0);
     }
 
     #[test]

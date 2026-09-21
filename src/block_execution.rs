@@ -24,7 +24,7 @@ use crate::{
     chainstate::{PreparedTransaction, is_unspendable},
     consensus::ConsensusError,
     execution_store::{ExecutionStoreError, ExecutionTip, RedbExecutionStore},
-    headers::HeaderDag,
+    headers::{HeaderReadError, HeaderView},
     undo_store::{PendingTransition, RedbUndoStore, TransitionKind, UndoStoreError},
     utxo::{OutPointKey, TierStats, Utxo, UtxoError, UtxoStore, UtxoUndo},
 };
@@ -59,19 +59,218 @@ pub struct BlockDeploymentContext {
 #[derive(Debug)]
 pub struct ActiveBlockUtxoPrefetch {
     entries: Vec<(OutPointKey, Option<Utxo>)>,
+    // Payload first: leases remain live until its actual owner drops.
+    memory: Vec<crate::node_memory::MemoryLease>,
 }
 
 impl ActiveBlockUtxoPrefetch {
-    /// The prefetched coins, for a store that must overlay what changed
-    /// since they were read.
-    pub fn entries_mut(&mut self) -> &mut [(OutPointKey, Option<Utxo>)] {
-        &mut self.entries
+    fn check_owner<C: ExecutionChainStore>(&self, store: &C) -> Result<(), ChainStoreError> {
+        if let Some(resources) = store.execution_spool() {
+            let owner = resources
+                .reserve_memory(0)
+                .map_err(ChainStoreError::ExecutionMemory)?;
+            if self.memory.is_empty() || self.memory.iter().any(|lease| !lease.shares_owner(&owner))
+            {
+                return Err(memory_error(
+                    "prefetch must be read or refreshed through this node owner",
+                ));
+            }
+        }
+        Ok(())
     }
+
+    /// Refreshes read-ahead atomically: old data and its reservations survive
+    /// any read/admission failure. Successful replacement moves owned coins.
+    pub fn refresh<C: ExecutionChainStore>(
+        &mut self,
+        store: &C,
+    ) -> Result<(), BlockExecutionError> {
+        let _keys = reserve_execution_memory(
+            store,
+            (self.entries.len() as u64).checked_mul(size_of::<OutPointKey>() as u64),
+        )?;
+        let keys: Vec<_> = self.entries.iter().map(|(key, _)| *key).collect();
+        let replacement = read_prefetch(store, &keys)?;
+        *self = replacement;
+        Ok(())
+    }
+}
+
+fn memory_error(message: &'static str) -> ChainStoreError {
+    ChainStoreError::ExecutionMemory(std::io::Error::other(message))
+}
+fn reserve_execution_memory<C: ExecutionChainStore>(
+    store: &C,
+    bytes: Option<u64>,
+) -> Result<Option<crate::node_memory::MemoryLease>, ChainStoreError> {
+    let Some(resources) = store.execution_spool() else {
+        return Ok(None);
+    };
+    let bytes = bytes.ok_or_else(|| memory_error("execution allocation estimate overflow"))?;
+    resources
+        .reserve_memory(bytes)
+        .map(Some)
+        .map_err(ChainStoreError::ExecutionMemory)
+}
+// Locally computed identifiers survive all three execution phases. Keep their
+// lease beside the payload so errors and ordinary completion release storage
+// before returning its allowance. Caller-supplied identifiers have a separate
+// owner and must not be charged a second time here.
+struct ComputedBatchTransactionIds {
+    ids: Vec<ValidatedBlockTransactionIds>,
+    _memory: Option<crate::node_memory::MemoryLease>,
+}
+impl ComputedBatchTransactionIds {
+    fn new<C: ExecutionChainStore>(store: &C, blocks: &[Block]) -> Result<Self, ChainStoreError> {
+        let bytes = blocks.iter().fold(
+            (blocks.len() as u64).checked_mul(size_of::<ValidatedBlockTransactionIds>() as u64),
+            |total, block| {
+                total?
+                    .checked_add((block.txdata.len() as u64).checked_mul(size_of::<Txid>() as u64)?)
+            },
+        );
+        let memory = reserve_execution_memory(store, bytes)?;
+        let ids = blocks
+            .iter()
+            .map(|block| {
+                ValidatedBlockTransactionIds::from_computed(
+                    block
+                        .txdata
+                        .iter()
+                        .map(bitcoin::Transaction::compute_txid)
+                        .collect(),
+                )
+            })
+            .collect();
+        Ok(Self {
+            ids,
+            _memory: memory,
+        })
+    }
+}
+
+fn discovery_reservation<'a, C: ExecutionChainStore>(
+    store: &C,
+    blocks: impl Iterator<Item = &'a Block>,
+) -> Result<Option<crate::node_memory::MemoryLease>, ChainStoreError> {
+    let mut bytes = Some(4096_u64);
+    for transaction in blocks.flat_map(|block| &block.txdata) {
+        bytes = bytes
+            .and_then(|n| {
+                n.checked_add(
+                    (transaction.input.len() as u64)
+                        .checked_mul(3 * size_of::<OutPointKey>() as u64)?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    (transaction.output.len() as u64)
+                        .checked_mul(8 * (size_of::<OutPointKey>() as u64 + 1))?,
+                )
+            });
+    }
+    reserve_execution_memory(store, bytes)
+}
+
+// The caller-facing read allowance covers canonical spendable coin records and
+// returned containers. Engine cache/dirty-page/internal read allocations remain
+// separate. A malformed backend can exceed its read contract before returning;
+// such payloads are rejected here, not accepted as accounted prefetch data.
+fn read_prefetch<C: ExecutionChainStore>(
+    store: &C,
+    keys: &[OutPointKey],
+) -> Result<ActiveBlockUtxoPrefetch, BlockExecutionError> {
+    const CHUNK: usize = 128;
+    let Some(resources) = store.execution_spool() else {
+        let entries = store
+            .get_many(keys)
+            .map_err(ChainStoreError::ExecutionRead)?;
+        if entries.len() != keys.len()
+            || entries
+                .iter()
+                .zip(keys)
+                .any(|((actual, _), expected)| actual != expected)
+        {
+            return Err(memory_error("prefetch read returned misaligned coins").into());
+        }
+        return Ok(ActiveBlockUtxoPrefetch {
+            entries,
+            memory: Vec::new(),
+        });
+    };
+    let count = keys.len() as u64;
+    let metadata = count
+        .checked_mul(size_of::<(OutPointKey, Option<Utxo>)>() as u64)
+        .and_then(|n| {
+            n.checked_add(
+                (keys.len().div_ceil(CHUNK) as u64 + 1)
+                    .checked_mul(8 * size_of::<crate::node_memory::MemoryLease>() as u64)?,
+            )
+        });
+    let container = resources
+        .reserve_memory(
+            metadata.ok_or_else(|| memory_error("prefetch metadata estimate overflow"))?,
+        )
+        .map_err(ChainStoreError::ExecutionMemory)?;
+    let mut memory = Vec::with_capacity(keys.len().div_ceil(CHUNK) + 1);
+    memory.push(container);
+    let mut entries = Vec::with_capacity(keys.len());
+    for wanted in keys.chunks(CHUNK) {
+        let allowance = (wanted.len() as u64)
+            * (4 * crate::chainstate::MAX_SCRIPT_SIZE as u64
+                + 16 * size_of::<(OutPointKey, Option<Utxo>)>() as u64)
+            + 65536;
+        let lease = resources
+            .reserve_memory(allowance)
+            .map_err(ChainStoreError::ExecutionMemory)?;
+        let current = store
+            .get_many(wanted)
+            .map_err(ChainStoreError::ExecutionRead)?;
+        if current.len() != wanted.len()
+            || current
+                .iter()
+                .zip(wanted)
+                .any(|((actual, _), expected)| actual != expected)
+        {
+            return Err(memory_error("prefetch read returned misaligned coins").into());
+        }
+        let mut retained = 0_u64;
+        for (_, coin) in &current {
+            if let Some(coin) = coin {
+                if coin.script_pubkey.len() > crate::chainstate::MAX_SCRIPT_SIZE {
+                    return Err(
+                        memory_error("prefetch contains an oversized unspendable coin").into(),
+                    );
+                }
+                retained = retained
+                    .checked_add(coin.script_pubkey.capacity() as u64)
+                    .ok_or_else(|| memory_error("prefetch script capacity overflow"))?;
+            }
+        }
+        if retained > allowance {
+            return Err(memory_error("prefetch read exceeded its payload allowance").into());
+        }
+        // Attach ownership before moving payload so unwinding cannot refund
+        // this chunk while the outer entries vector still contains its coins.
+        memory.push(lease);
+        entries.extend(current);
+        // Returned temporary containers have now been destroyed; only scripts
+        // and the separately reserved final vector remain owned by prefetch.
+        memory
+            .last_mut()
+            .expect("chunk lease was attached")
+            .shrink_to(retained)
+            .map_err(ChainStoreError::ExecutionMemory)?;
+    }
+    Ok(ActiveBlockUtxoPrefetch { entries, memory })
 }
 
 /// Failures while connecting one downloaded active-chain block.
 #[derive(Debug, Error)]
 pub enum BlockExecutionError {
+    /// Reading validated local header history failed before execution publication.
+    #[error("header lookup: {0}")]
+    HeaderRead(#[from] HeaderReadError),
     /// The persisted execution tip is no longer on the selected active header chain.
     #[error("execution tip {height}:{hash} is not on the active header chain")]
     TipNotActive {
@@ -305,7 +504,7 @@ pub fn recover_pending_transition<S: UtxoStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_active_block<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &Block,
     now: u64,
     hot_window_secs: u64,
@@ -345,7 +544,7 @@ pub fn connect_active_block<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_active_blocks<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     hot_window_secs: u64,
@@ -374,7 +573,7 @@ pub fn connect_active_blocks<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     hot_window_secs: u64,
@@ -401,7 +600,7 @@ pub fn connect_prevalidated_active_blocks<C: ExecutionChainStore>(
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     now: u64,
@@ -446,10 +645,10 @@ pub fn prefetch_prevalidated_active_block_utxos<C: ExecutionChainStore>(
         .flat_map(|block| &block.txdata)
         .map(|transaction| transaction.output.len())
         .sum::<usize>();
+    let _discovery = discovery_reservation(chainstate, blocks.iter())?;
     let input_outpoints =
         external_batch_input_outpoints(blocks, Some(transaction_ids), output_count);
-    let entries = chainstate.get_many(&input_outpoints)?;
-    Ok(ActiveBlockUtxoPrefetch { entries })
+    read_prefetch(chainstate, &input_outpoints)
 }
 
 /// [`prefetch_prevalidated_active_block_utxos`] over blocks that are not held
@@ -474,16 +673,16 @@ pub fn prefetch_active_block_utxos_from<'a, C: ExecutionChainStore>(
             .map(|transaction| transaction.output.len())
             .sum::<usize>();
     }
+    let _discovery = discovery_reservation(chainstate, blocks.clone().map(|(block, _)| block))?;
     let input_outpoints = external_input_outpoints_with_ids(blocks, output_count);
-    let entries = chainstate.get_many(&input_outpoints)?;
-    Ok(ActiveBlockUtxoPrefetch { entries })
+    read_prefetch(chainstate, &input_outpoints)
 }
 
 /// Connects a prevalidated batch using UTXOs read before archive staging ended.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     prefetched_utxos: ActiveBlockUtxoPrefetch,
@@ -519,7 +718,7 @@ pub fn connect_prevalidated_active_blocks_with_txids_and_utxos<C: ExecutionChain
 #[allow(clippy::too_many_arguments)]
 pub fn connect_prevalidated_active_blocks_with_breakdown<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     transaction_ids: &[ValidatedBlockTransactionIds],
     prefetched_utxos: ActiveBlockUtxoPrefetch,
@@ -665,7 +864,7 @@ fn external_batch_input_outpoints(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn connect_active_blocks_inner<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     blocks: &[Block],
     now: u64,
     _hot_window_secs: u64,
@@ -699,18 +898,27 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         return Err(BlockExecutionError::TransactionIdCount);
     }
 
-    let mut current = chainstate.execution_tip()?;
+    let current = chainstate.execution_tip()?;
     let output_count = blocks
         .iter()
         .flat_map(|block| &block.txdata)
         .map(|transaction| transaction.output.len())
         .sum::<usize>();
+    let discovery = discovery_reservation(chainstate, blocks.iter())?;
     let input_outpoints = external_batch_input_outpoints(blocks, transaction_ids, output_count);
-    let cumulative = UtxoOverlay::with_capacity(
-        chainstate,
-        input_outpoints.len().saturating_add(output_count),
-    );
+    let capacity = input_outpoints.len().saturating_add(output_count);
+    let overlay_bytes = (capacity as u64)
+        .checked_add(OVERLAY_SHARDS as u64)
+        .and_then(|n| {
+            n.checked_mul(
+                16 * (size_of::<(OutPointKey, Option<Utxo>)>() as u64 + 1)
+                    + size_of::<Mutex<OverlayState>>() as u64,
+            )
+        });
+    let overlay_memory = reserve_execution_memory(chainstate, overlay_bytes)?;
+    let cumulative = UtxoOverlay::with_capacity_reserved(chainstate, capacity, overlay_memory);
     if let Some(prefetched_utxos) = prefetched_utxos {
+        prefetched_utxos.check_owner(chainstate)?;
         if prefetched_utxos.entries.len() != input_outpoints.len()
             || prefetched_utxos
                 .entries
@@ -720,10 +928,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         {
             return Err(BlockExecutionError::UtxoPrefetchMismatch);
         }
-        cumulative.seed_prefetched(prefetched_utxos.entries);
+        cumulative.seed_prefetched(prefetched_utxos);
     } else {
-        cumulative.prefetch(&input_outpoints)?;
+        cumulative.seed_prefetched(read_prefetch(chainstate, &input_outpoints)?);
     }
+    drop(input_outpoints);
+    drop(discovery);
     let retains_undo = chainstate.retains_block_undo();
     // Which block each height belongs to, checked against the active chain
     // once for the whole batch; workers then prepare blocks independently.
@@ -731,7 +941,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let mut tips = Vec::with_capacity(blocks.len());
     let mut parent_mtps = Vec::with_capacity(blocks.len());
     let mut parent_hash = base.hash;
-    let active_base = headers.active_header_at(base.height);
+    let active_base = headers.active_header(base.height)?;
     if active_base.is_none_or(|header| header.hash != base.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: base.height,
@@ -745,7 +955,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             .and_then(|height| height.checked_add(1))
             .ok_or(BlockExecutionError::NoNextHeader(base.height))?;
         let expected = headers
-            .active_header_at(height)
+            .active_header(height)?
             .ok_or(BlockExecutionError::NoNextHeader(height.saturating_sub(1)))?;
         let actual = block.block_hash();
         if actual != expected.hash {
@@ -755,7 +965,7 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             });
         }
         let parent_mtp = headers
-            .median_time_past(parent_hash)
+            .median_time_past(parent_hash)?
             .ok_or(BlockExecutionError::MissingParentMtp(parent_hash))?;
         tips.push(ExecutionTip {
             height,
@@ -768,19 +978,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let transaction_ids = if let Some(ids) = transaction_ids {
         ids
     } else {
-        computed_ids = blocks
-            .iter()
-            .map(|block| {
-                ValidatedBlockTransactionIds::from_computed(
-                    block
-                        .txdata
-                        .iter()
-                        .map(bitcoin::Transaction::compute_txid)
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        computed_ids.as_slice()
+        computed_ids = ComputedBatchTransactionIds::new(chainstate, blocks)?;
+        computed_ids.ids.as_slice()
     };
 
     let workers = std::thread::available_parallelism()
@@ -792,6 +991,15 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     // transactions alone — created outputs carry their final values and
     // scripts, spends are the inputs. Built in parallel per block, merged in
     // block order into one versioned view of the whole batch.
+    let execution_resources = chainstate.execution_spool();
+    let version_reservation = execution_resources
+        .as_ref()
+        .map(|resources| {
+            resources
+                .reserve_memory(version_index_memory(blocks)?)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let phase_one_started = Instant::now();
     let tx_deltas: Vec<std::sync::OnceLock<TxDelta>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
@@ -869,6 +1077,17 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     let use_script_pool = blocks.len() > 1;
     let script_batches: Mutex<Vec<DeferredScriptBatch>> = Mutex::new(Vec::new());
     let serial_scripts: Mutex<Vec<DeferredScriptCheck<'_>>> = Mutex::new(Vec::new());
+    // Indexed callers still retain applied undo vectors. The ordinary node
+    // path drops those copies and can evict completed preparation to disk.
+    let spool = if applied_undos == AppliedUndos::Drop {
+        execution_resources
+            .as_ref()
+            .map(crate::execution_spool::ExecutionSpoolContext::open)
+            .transpose()
+            .map_err(ChainStoreError::ExecutionSpool)?
+    } else {
+        None
+    };
     let prepared_slots: Vec<std::sync::OnceLock<PreparedSlot>> = (0..blocks.len())
         .map(|_| std::sync::OnceLock::new())
         .collect();
@@ -879,6 +1098,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         for _ in 0..workers {
             let next = &next_prepare;
             let prepared_slots = &prepared_slots;
+            let spool = spool.as_ref();
+            let resources = execution_resources.as_ref();
             let versions = &versions;
             let cumulative = &cumulative;
             let tips = &tips;
@@ -910,11 +1131,12 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                         &deployments[index],
                         structure_prevalidated,
                         Some(transaction_ids[index].as_slice()),
+                        resources,
                     );
                     // Scripts go to the pool the moment a block is prepared,
                     // so the script workers run beside the rest of the
                     // batch's preparation instead of after it.
-                    let prepared = prepared.map(|(prepared, delta, mut scripts)| {
+                    let prepared = prepared.and_then(|(prepared, delta, mut scripts)| {
                         let submit_started = Instant::now();
                         for script in &mut scripts {
                             script.set_block_order(index);
@@ -928,7 +1150,23 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
                                 .extend(scripts);
                         }
                         submit_elapsed += submit_started.elapsed();
-                        (prepared, delta)
+                        if let Some(spool) = spool {
+                            let changes = delta.into_net_changes();
+                            let applied = prepared.into_applied(retains_undo);
+                            let transition = ConnectTransition {
+                                expected_parent: block_current.hash,
+                                next: tips[index],
+                                spent: changes.spent,
+                                created: changes.created,
+                                transaction_undos: applied.transaction_undos,
+                            };
+                            let record = spool
+                                .write(&transition)
+                                .map_err(ChainStoreError::ExecutionSpool)?;
+                            Ok(PreparedResult::Disk(record))
+                        } else {
+                            Ok(PreparedResult::Memory(prepared, delta))
+                        }
                     });
                     prepared_slots[index]
                         .set(prepared)
@@ -950,6 +1188,10 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         }
     });
     drop(versions);
+    drop(version_reservation);
+    // Preparation has copied every needed input into its result/script work.
+    // The prefetch cache must not overlap transition construction or commit.
+    drop(cumulative);
     breakdown.validate += validate_started.elapsed();
     {
         let [prepare, utxo, net_change, checks] =
@@ -962,7 +1204,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
     breakdown.submit += *submit_total.lock().expect("submit total lock not poisoned");
     // The first failing block wins, exactly as sequential preparation would
     // have reported it; a script failure outranks it only when it belongs to
-    // an earlier block. Nothing was written anywhere.
+    // an earlier block. Only disposable preparation files may have been written;
+    // no execution state has been published.
     let mut prepared_blocks = Vec::with_capacity(blocks.len());
     let mut failure = None;
     for (index, slot) in prepared_slots.into_iter().enumerate() {
@@ -1005,70 +1248,6 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         return Err(error);
     }
 
-    // Phase three: transitions and undo records, again in parallel per
-    // block, collected in block order.
-    let apply_started = Instant::now();
-    let finished_slots: Vec<std::sync::OnceLock<FinishedSlot>> = (0..prepared_blocks.len())
-        .map(|_| std::sync::OnceLock::new())
-        .collect();
-    let next_finish = std::sync::atomic::AtomicUsize::new(0);
-    let prepared_blocks = Mutex::new(prepared_blocks.into_iter().map(Some).collect::<Vec<_>>());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let next = &next_finish;
-            let finished_slots = &finished_slots;
-            let prepared_blocks = &prepared_blocks;
-            let tips = &tips;
-            scope.spawn(move || {
-                loop {
-                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(slot) = finished_slots.get(index) else {
-                        break;
-                    };
-                    let (prepared, delta) = {
-                        let mut prepared_blocks =
-                            prepared_blocks.lock().expect("prepared lock not poisoned");
-                        prepared_blocks[index]
-                            .take()
-                            .expect("each block index is claimed once")
-                    };
-                    let changes = delta.net_changes();
-                    let mut applied = prepared.into_applied(retains_undo);
-                    let expected_parent = if index == 0 {
-                        base.hash
-                    } else {
-                        tips[index - 1].hash
-                    };
-                    let transition = ConnectTransition {
-                        expected_parent,
-                        next: tips[index],
-                        spent: changes.spent,
-                        created: changes.created,
-                        transaction_undos: match (retains_undo, applied_undos) {
-                            (false, _) => Vec::new(),
-                            (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
-                            (true, AppliedUndos::Drop) => {
-                                std::mem::take(&mut applied.transaction_undos)
-                            }
-                        },
-                    };
-                    slot.set((transition, applied))
-                        .unwrap_or_else(|_| unreachable!("each block index is claimed once"));
-                }
-            });
-        }
-    });
-    let mut applied_blocks = Vec::with_capacity(finished_slots.len());
-    let mut transitions = Vec::with_capacity(finished_slots.len());
-    for slot in finished_slots {
-        let (transition, applied) = slot.into_inner().expect("phase three covered every block");
-        transitions.push(transition);
-        applied_blocks.push(applied);
-    }
-    breakdown.apply += apply_started.elapsed();
-    current = *tips.last().expect("non-empty batch has a final tip");
-    let _ = current;
-
     let wait_started = Instant::now();
     let own_batches = script_batches
         .into_inner()
@@ -1078,7 +1257,8 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // A store may flush at any batch/coin limit, during maintenance, or
     // immediately (without a write-back wrapper). Every script in this
-    // batch must therefore finish before handing its transitions to it.
+    // batch must therefore finish before handing its transitions to it. Drain
+    // here so completed script inputs do not overlap transition construction.
     let mut batches = script_carry.map(std::mem::take).unwrap_or_default();
     batches.extend(own_batches);
     let script_failure = drain_script_batches(batches, serial);
@@ -1089,16 +1269,72 @@ fn connect_active_blocks_inner<C: ExecutionChainStore>(
             source: source.into(),
         }));
     }
+
+    // Phase three consumes prepared blocks in order. A streaming store keeps
+    // only the current transition alive inside its atomic transaction; source
+    // errors abort the entire checkpoint. Scripts have already drained.
+    let mut applied_blocks = Vec::with_capacity(prepared_blocks.len());
+    let mut apply_elapsed = Duration::ZERO;
+    let mut transitions = prepared_blocks
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let apply_started = Instant::now();
+            let (prepared, delta) = match result {
+                PreparedResult::Memory(prepared, delta) => (prepared, delta),
+                PreparedResult::Disk(record) => {
+                    let transition = spool
+                        .as_ref()
+                        .expect("disk result owns a spool")
+                        .read(&record)
+                        .map_err(ChainStoreError::ExecutionSpool)?;
+                    applied_blocks.push(AppliedBlock {
+                        hash: transition.next.hash,
+                        transaction_undos: Vec::new(),
+                    });
+                    apply_elapsed += apply_started.elapsed();
+                    return Ok(transition);
+                }
+            };
+            let changes = delta.into_net_changes();
+            let mut applied = prepared.into_applied(retains_undo);
+            let transition = ConnectTransition {
+                expected_parent: if index == 0 {
+                    base.hash
+                } else {
+                    tips[index - 1].hash
+                },
+                next: tips[index],
+                spent: changes.spent,
+                created: changes.created,
+                transaction_undos: match (retains_undo, applied_undos) {
+                    (false, _) => Vec::new(),
+                    (true, AppliedUndos::Keep) => applied.transaction_undos.clone(),
+                    (true, AppliedUndos::Drop) => std::mem::take(&mut applied.transaction_undos),
+                },
+            };
+            applied_blocks.push(applied);
+            apply_elapsed += apply_started.elapsed();
+            Ok(match changes.memory {
+                Some(memory) => {
+                    crate::chain_store::LeasedConnectTransition::with_shared_reservation(
+                        transition, memory,
+                    )
+                }
+                None => transition.into(),
+            })
+        });
     let commit_started = Instant::now();
-    chainstate.commit_connect_batch_owned(transitions)?;
-    breakdown.commit = commit_started.elapsed();
+    chainstate.commit_connect_batch_stream(&mut transitions, tips.last().copied())?;
+    breakdown.apply += apply_elapsed;
+    breakdown.commit = commit_started.elapsed().saturating_sub(apply_elapsed);
     Ok((applied_blocks, breakdown))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn validate_active_block<S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &Block,
     current: ExecutionTip,
     now: u64,
@@ -1126,19 +1362,50 @@ fn validate_active_block<S: UtxoStore>(
     })
 }
 
+// Admission for original preparation and its net/undo conversion. Hash table
+// rounding/growth, read-result overlap and vector relocation are conservative;
+// deferred script copies have a separate lease. Canonical input scripts are
+// bounded by the execution read contract, including overwritten BIP30 coins.
+fn preparation_memory(block: &Block) -> Option<u64> {
+    let mut bytes = 4096_u64;
+    let key = size_of::<OutPointKey>() as u64;
+    let coin = size_of::<Utxo>() as u64;
+    let hash = 8 * (key + size_of::<Option<Utxo>>() as u64 + 1) + 8 * (key + 1);
+    for transaction in &block.txdata {
+        bytes = bytes.checked_add(
+            3 * (size_of::<PreparedTransaction>() as u64
+                + UtxoUndo::allocation_overhead() as u64
+                + size_of::<Txid>() as u64),
+        )?;
+        let entries =
+            (transaction.input.len() as u64).checked_add(transaction.output.len() as u64)?;
+        bytes = bytes.checked_add(entries.checked_mul(hash + 12 * key)?)?;
+        // Originals, bulk-lookup overlap, and BIP30 pre-images; covers both
+        // retained vectors and the transient read/undo conversion containers.
+        bytes = bytes.checked_add(
+            entries.checked_mul(4 * (coin + key + crate::chainstate::MAX_SCRIPT_SIZE as u64))?,
+        )?;
+        for output in &transaction.output {
+            bytes = bytes.checked_add((output.script_pubkey.len() as u64).checked_mul(4)?)?;
+        }
+    }
+    Some(bytes)
+}
+
 /// The pipeline's counterpart of [`validate_active_block_inner`]: the same
 /// header, BIP30 and structure checks, then every transaction resolved and
 /// checked against a [`BlockPrepareView`] without writing anything.
 #[allow(clippy::too_many_arguments)]
 fn prepare_active_block_inner<'a, S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &'a Block,
     current: ExecutionTip,
     now: u64,
     deployments: &BlockDeploymentContext,
     structure_prevalidated: bool,
     transaction_ids: Option<&[Txid]>,
+    resources: Option<&crate::execution_spool::ExecutionSpoolContext>,
 ) -> Result<
     (
         PreparedActiveBlock,
@@ -1148,7 +1415,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
     BlockExecutionError,
 > {
     let checks_started = Instant::now();
-    let active_current = headers.active_header_at(current.height);
+    let active_current = headers.active_header(current.height)?;
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: current.height,
@@ -1160,7 +1427,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         .checked_add(1)
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let expected = headers
-        .active_header_at(next_height)
+        .active_header(next_height)?
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let actual = block.block_hash();
     if actual != expected.hash {
@@ -1170,14 +1437,24 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         });
     }
     let parent_mtp = headers
-        .median_time_past(current.hash)
+        .median_time_past(current.hash)?
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
+    let memory = resources
+        .map(|resources| {
+            let bytes = preparation_memory(block)
+                .ok_or_else(|| memory_error("block preparation allocation estimate overflow"))?;
+            resources
+                .reserve_memory(bytes)
+                .map(Arc::new)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let capacity = block
         .txdata
         .iter()
         .map(|transaction| transaction.input.len() + transaction.output.len())
         .sum();
-    let view = BlockPrepareView::new(chainstate, capacity);
+    let view = BlockPrepareView::new(chainstate, capacity, memory.clone());
     let exception_undo = prepare_bip30_rules(&view, block, deployments)?;
     if !structure_prevalidated {
         validate_block_structure_with_deployments(
@@ -1201,6 +1478,17 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
             .collect::<Vec<_>>();
         computed_ids.as_slice()
     };
+    let script_memory = resources
+        .filter(|_| block.txdata.len() > 1)
+        .map(|resources| {
+            let bytes = crate::blockchain::deferred_script_memory(block)
+                .ok_or_else(|| memory_error("deferred script allocation estimate overflow"))?;
+            resources
+                .reserve_memory(bytes)
+                .map(Arc::new)
+                .map_err(ChainStoreError::ExecutionMemory)
+        })
+        .transpose()?;
     let (prepared, scripts) = prepare_prevalidated_block_with_deferred_scripts(
         &view,
         block,
@@ -1211,6 +1499,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         deployments.script_flags,
         deployments.csv_active,
         deployments.subsidy_sats,
+        script_memory.as_ref(),
         |transaction| view.record(transaction),
     )
     .map_err(BlockExecutionError::Block)?;
@@ -1218,6 +1507,7 @@ fn prepare_active_block_inner<'a, S: UtxoStore>(
         PreparedActiveBlock {
             block: prepared,
             exception_undo,
+            memory,
         },
         view.into_delta(),
         scripts,
@@ -1253,7 +1543,7 @@ fn prepare_bip30_rules<S: UtxoStore>(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn validate_active_block_inner<'a, S: UtxoStore>(
     chainstate: &S,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     block: &'a Block,
     current: ExecutionTip,
     now: u64,
@@ -1264,7 +1554,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
     transaction_ids: Option<&[Txid]>,
 ) -> Result<(AppliedBlock, BlockDelta, Vec<DeferredScriptCheck<'a>>), BlockExecutionError> {
     let checks_started = Instant::now();
-    let active_current = headers.active_header_at(current.height);
+    let active_current = headers.active_header(current.height)?;
     if active_current.is_none_or(|header| header.hash != current.hash) {
         return Err(BlockExecutionError::TipNotActive {
             height: current.height,
@@ -1276,7 +1566,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         .checked_add(1)
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let expected = headers
-        .active_header_at(next_height)
+        .active_header(next_height)?
         .ok_or(BlockExecutionError::NoNextHeader(current.height))?;
     let actual = block.block_hash();
     if actual != expected.hash {
@@ -1286,7 +1576,7 @@ fn validate_active_block_inner<'a, S: UtxoStore>(
         });
     }
     let parent_mtp = headers
-        .median_time_past(current.hash)
+        .median_time_past(current.hash)?
         .ok_or(BlockExecutionError::MissingParentMtp(current.hash))?;
     let overlay = UtxoOverlay::new(chainstate);
     let exception_undo = apply_bip30_rules(&overlay, block, deployments)?;
@@ -1396,6 +1686,7 @@ struct UtxoChanges {
     spent: Vec<OutPointKey>,
     created: Vec<(OutPointKey, Utxo)>,
     undo: UtxoUndo,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 /// Independently locked shards per overlay.
@@ -1418,6 +1709,58 @@ const PREPARE_WORKERS: usize = 8;
 type TxDelta = (Vec<(OutPointKey, Arc<Utxo>)>, Vec<OutPointKey>);
 /// Every version each key takes across a batch, tagged by the block index
 /// that wrote it, in block order.
+// Account the version index before creating any of its slots, vectors, hash
+// buckets or output script copies. This estimate is deliberately conservative:
+// eight bucket slots per logical key cover load-factor rounding and simultaneous
+// old/new tables during growth; three vector elements cover geometric growth
+// and relocation. Original block inputs, prefetch, worker stacks and prepared
+// results are separate owners and are not included in this reservation.
+fn version_index_memory(blocks: &[Block]) -> Result<u64, ChainStoreError> {
+    let overflow = || {
+        ChainStoreError::ExecutionMemory(std::io::Error::other(
+            "version index allocation estimate overflow",
+        ))
+    };
+    let mut outputs = 0_u64;
+    let mut inputs = 0_u64;
+    let mut scripts = 0_u64;
+    for block in blocks {
+        for transaction in &block.txdata {
+            outputs = outputs
+                .checked_add(u64::try_from(transaction.output.len()).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            inputs = inputs
+                .checked_add(u64::try_from(transaction.input.len()).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            for output in &transaction.output {
+                scripts = scripts
+                    .checked_add(u64::try_from(output.script_pubkey.len()).map_err(|_| overflow())?)
+                    .ok_or_else(overflow)?;
+            }
+        }
+    }
+    let entries = inputs
+        .checked_add(outputs)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(overflow)?;
+    let hash_slot = size_of::<(OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>)>() as u64 + 1;
+    let history_slot = size_of::<(u32, Option<Arc<Utxo>>)>() as u64;
+    let created_slot = size_of::<(OutPointKey, Arc<Utxo>)>() as u64;
+    let coin = (size_of::<Utxo>() + 2 * size_of::<usize>() + 64) as u64;
+    let terms = [
+        entries.checked_mul(8 * hash_slot + 3 * history_slot),
+        outputs.checked_mul(3 * created_slot + coin),
+        inputs.checked_mul(3 * size_of::<OutPointKey>() as u64),
+        scripts.checked_mul(2),
+        (blocks.len() as u64).checked_mul(size_of::<std::sync::OnceLock<TxDelta>>() as u64),
+    ];
+    terms.into_iter().try_fold(0_u64, |total, term| {
+        total
+            .checked_add(term.ok_or_else(overflow)?)
+            .ok_or_else(overflow)
+    })
+}
+
 type CoinVersions = AHashMap<OutPointKey, Vec<(u32, Option<Arc<Utxo>>)>>;
 /// Waits for every script batch and returns the first failure by batch
 /// order, verifying any serially collected checks as block zero.
@@ -1449,10 +1792,11 @@ pub(crate) fn drain_script_batches(
 
 /// One block's parallel-preparation result, in batch order; its deferred
 /// script checks were already handed to the pool by the preparing worker.
-type PreparedSlot = Result<(PreparedActiveBlock, PreparedDelta), BlockExecutionError>;
-/// One block's transition and applied record.
-type FinishedSlot = (ConnectTransition, AppliedBlock);
-
+type PreparedSlot = Result<PreparedResult, BlockExecutionError>;
+enum PreparedResult {
+    Memory(PreparedActiveBlock, PreparedDelta),
+    Disk(crate::execution_spool::Record),
+}
 /// The whole batch's coin history as of one block: every version each key
 /// takes across the batch, tagged with the block that wrote it. A block reads
 /// the latest version an *earlier* block left and never a later one, so every
@@ -1586,6 +1930,7 @@ pub(crate) struct PreparedDelta {
     /// Keys the block spent (or overwrote under BIP30) that existed before it,
     /// as opposed to coins it created and spent itself.
     spent_from_base: AHashSet<OutPointKey>,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl PreparedDelta {
@@ -1593,6 +1938,7 @@ impl PreparedDelta {
         Self {
             state: AHashMap::with_capacity(capacity),
             spent_from_base: AHashSet::with_capacity(capacity),
+            memory: None,
         }
     }
 
@@ -1622,12 +1968,12 @@ impl PreparedDelta {
     /// The block's net effect: coins it leaves behind, keys it removed from
     /// the state it started from. A BIP30 overwrite puts a key in both, the
     /// removal first. Sorted like the overlay's `net_changes`.
-    fn net_changes(&self) -> UtxoChanges {
-        let mut spent: Vec<OutPointKey> = self.spent_from_base.iter().copied().collect();
+    fn into_net_changes(self) -> UtxoChanges {
+        let mut spent: Vec<OutPointKey> = self.spent_from_base.into_iter().collect();
         let mut created: Vec<(OutPointKey, Utxo)> = self
             .state
-            .iter()
-            .filter_map(|(outpoint, value)| value.as_ref().map(|utxo| (*outpoint, utxo.clone())))
+            .into_iter()
+            .filter_map(|(outpoint, value)| value.map(|utxo| (outpoint, utxo)))
             .collect();
         spent.sort_unstable();
         created.sort_unstable_by_key(|(outpoint, _)| *outpoint);
@@ -1637,6 +1983,7 @@ impl PreparedDelta {
             spent,
             created,
             undo: UtxoUndo::from_parts(Vec::new(), Vec::new()),
+            memory: self.memory,
         }
     }
 }
@@ -1649,10 +1996,16 @@ struct BlockPrepareView<'a, S> {
 }
 
 impl<'a, S: UtxoStore> BlockPrepareView<'a, S> {
-    fn new(base: &'a S, capacity: usize) -> Self {
+    fn new(
+        base: &'a S,
+        capacity: usize,
+        memory: Option<Arc<crate::node_memory::MemoryLease>>,
+    ) -> Self {
+        let mut delta = PreparedDelta::with_capacity(capacity);
+        delta.memory = memory;
         Self {
             base,
-            delta: Mutex::new(PreparedDelta::with_capacity(capacity)),
+            delta: Mutex::new(delta),
         }
     }
 
@@ -1760,6 +2113,7 @@ impl<S: UtxoStore> UtxoStore for BlockPrepareView<'_, S> {
 struct PreparedActiveBlock {
     block: PreparedBlock,
     exception_undo: Option<UtxoUndo>,
+    memory: Option<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl PreparedActiveBlock {
@@ -1782,6 +2136,14 @@ impl PreparedActiveBlock {
                     .collect();
                 transaction_undos.push(UtxoUndo::from_parts(spent, created));
             }
+        } else {
+            drop(self.block);
+            drop(self.exception_undo);
+        }
+        if let Some(memory) = self.memory {
+            for undo in &transaction_undos {
+                undo.retain_memory(Arc::clone(&memory));
+            }
         }
         AppliedBlock {
             hash,
@@ -1798,6 +2160,7 @@ impl PreparedActiveBlock {
 /// it off the validation thread.
 struct BlockDelta {
     shards: Vec<Mutex<OverlayState>>,
+    _memory: Mutex<Vec<crate::node_memory::MemoryLease>>,
 }
 
 impl BlockDelta {
@@ -1840,6 +2203,7 @@ fn net_changes_of(shards: &[Mutex<OverlayState>]) -> Result<UtxoChanges, UtxoErr
         spent,
         created,
         undo: UtxoUndo::new(undo_spent, undo_created),
+        memory: None,
     })
 }
 
@@ -1847,6 +2211,7 @@ fn net_changes_of(shards: &[Mutex<OverlayState>]) -> Result<UtxoChanges, UtxoErr
 struct UtxoOverlay<'a, S> {
     base: &'a S,
     shards: Vec<Mutex<OverlayState>>,
+    prefetch_memory: Mutex<Vec<crate::node_memory::MemoryLease>>,
 }
 
 impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
@@ -1855,8 +2220,17 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     }
 
     fn with_capacity(base: &'a S, capacity: usize) -> Self {
+        Self::with_capacity_reserved(base, capacity, None)
+    }
+
+    fn with_capacity_reserved(
+        base: &'a S,
+        capacity: usize,
+        memory: Option<crate::node_memory::MemoryLease>,
+    ) -> Self {
         let per_shard = capacity.div_ceil(OVERLAY_SHARDS);
         Self {
+            prefetch_memory: Mutex::new(memory.into_iter().collect()),
             base,
             shards: (0..OVERLAY_SHARDS)
                 .map(|_| {
@@ -1910,17 +2284,8 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     fn into_delta(self) -> BlockDelta {
         BlockDelta {
             shards: self.shards,
+            _memory: self.prefetch_memory,
         }
-    }
-
-    /// Folds a block's net change in. The batch overlay's own net change is
-    /// never read on the pipelined path — the blocks carry their transitions
-    /// — so only `current` is maintained: reads consult it first, and a key
-    /// the block wrote needs no `original` entry to be answered correctly.
-    fn prefetch(&self, outpoints: &[OutPointKey]) -> Result<(), UtxoError> {
-        let prefetched = self.base.get_many(outpoints)?;
-        self.seed_prefetched(prefetched);
-        Ok(())
     }
 
     /// Seeds the read cache with coins fetched ahead of validation.
@@ -1928,7 +2293,15 @@ impl<'a, S: UtxoStore> UtxoOverlay<'a, S> {
     /// A batch's inputs run to millions of coins; they are partitioned by
     /// shard once and inserted by a few threads that each own a shard range,
     /// so no two threads ever contend for a lock.
-    fn seed_prefetched(&self, prefetched: Vec<(OutPointKey, Option<Utxo>)>) {
+    fn seed_prefetched(&self, prefetched: ActiveBlockUtxoPrefetch) {
+        let ActiveBlockUtxoPrefetch {
+            entries: prefetched,
+            memory,
+        } = prefetched;
+        self.prefetch_memory
+            .lock()
+            .expect("prefetch memory lock not poisoned")
+            .extend(memory);
         if prefetched.len() < PARALLEL_SEED_THRESHOLD {
             for (outpoint, value) in prefetched {
                 self.shard(&outpoint).original.insert(outpoint, value);
@@ -2273,7 +2646,7 @@ fn apply_bip30_rules<S: UtxoStore>(
 /// common ancestor before connecting a stronger branch.
 pub fn disconnect_execution_tip<C: ExecutionChainStore>(
     chainstate: &C,
-    headers: &HeaderDag,
+    headers: &dyn HeaderView,
     now: u64,
     hot_window_secs: u64,
 ) -> Result<ExecutionTip, BlockExecutionError> {
@@ -2288,11 +2661,11 @@ pub fn disconnect_execution_tip<C: ExecutionChainStore>(
         });
     }
     let current_header = headers
-        .get(&current.hash)
+        .header(&current.hash)?
         .ok_or(BlockExecutionError::MissingExecutedHeader(current.hash))?;
     let parent_hash = current_header.header.prev_blockhash;
     let parent = headers
-        .get(&parent_hash)
+        .header(&parent_hash)?
         .ok_or(BlockExecutionError::MissingExecutedHeader(parent_hash))?;
     if parent.height.checked_add(1) != Some(current.height) {
         return Err(BlockExecutionError::MissingExecutedHeader(parent_hash));
@@ -2346,6 +2719,41 @@ mod tests {
         headers::HeaderDag,
         utxo::{OutPointKey, RedbUtxoStore, Utxo, UtxoStore},
     };
+
+    #[test]
+    fn consuming_prepared_delta_moves_scripts_and_preserves_net_changes() {
+        let key = |byte| OutPointKey::from(OutPoint::new(Txid::from_byte_array([byte; 32]), 0));
+        let coin = Utxo {
+            value_sats: 42,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 3,
+            creation_mtp: 2,
+            script_pubkey: vec![0x51; 10_000],
+        };
+        let allocation = coin.script_pubkey.as_ptr();
+        let mut delta = PreparedDelta::with_capacity(3);
+        delta.state.insert(key(2), Some(coin));
+        delta.spend(key(1));
+        delta.state.insert(
+            key(3),
+            Some(Utxo {
+                value_sats: 1,
+                height: 1,
+                is_coinbase: false,
+                last_touched: 3,
+                creation_mtp: 2,
+                script_pubkey: vec![],
+            }),
+        );
+        delta.spend(key(3)); // output created and spent within this block
+        let changes = delta.into_net_changes();
+        assert_eq!(changes.spent, vec![key(1)]);
+        assert_eq!(changes.created.len(), 1);
+        assert_eq!(changes.created[0].0, key(2));
+        assert_eq!(changes.created[0].1.script_pubkey.as_ptr(), allocation);
+        assert_eq!(changes.created[0].1.value_sats, 42);
+    }
 
     #[test]
     fn only_downloaded_consensus_failures_are_peer_invalid() {
@@ -2616,6 +3024,130 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn disk_header_views_execute_reorg_and_fail_closed_on_read_errors() {
+        use crate::deployments::DeploymentConfig;
+        use crate::header_index::DiskHeaderIndex;
+        use crate::headers::{HeaderInfo, HeaderReadError, HeaderView, HeaderWorkBudget};
+        struct FailedRead<'a>(&'a dyn HeaderView);
+        impl HeaderView for FailedRead<'_> {
+            fn deployments(&self) -> &DeploymentConfig {
+                self.0.deployments()
+            }
+            fn active_tip(&self) -> HeaderInfo {
+                self.0.active_tip()
+            }
+            fn header(&self, _: &BlockHash) -> Result<Option<HeaderInfo>, HeaderReadError> {
+                Err(HeaderReadError::Unavailable(
+                    "injected header read failure".into(),
+                ))
+            }
+            fn active_header(&self, _: u32) -> Result<Option<HeaderInfo>, HeaderReadError> {
+                Err(HeaderReadError::Unavailable(
+                    "injected active read failure".into(),
+                ))
+            }
+        }
+        let directory = TempDir::new().unwrap();
+        let chainstate =
+            RedbChainStore::open(directory.path().join("chainstate"), Network::Regtest).unwrap();
+        let mut headers = DiskHeaderIndex::create(
+            directory.path().join("index"),
+            DeploymentConfig::for_network(Network::Regtest),
+        )
+        .unwrap();
+        let genesis = headers.snapshot().unwrap().active_tip();
+        let first = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .append(&[first.header], u32::MAX, &mut HeaderWorkBudget::default())
+            .unwrap();
+        let original = headers.snapshot().unwrap();
+        let error = connect_active_block(
+            &chainstate,
+            &FailedRead(&original),
+            &first,
+            1,
+            60,
+            &deployments(1),
+        )
+        .unwrap_err();
+        assert!(matches!(error, BlockExecutionError::HeaderRead(_)));
+        assert!(!error.is_peer_invalid());
+        assert_eq!(chainstate.execution().tip().unwrap().hash, genesis.hash);
+        assert!(
+            chainstate
+                .undos()
+                .get(first.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        connect_active_block(&chainstate, &original, &first, 1, 60, &deployments(1)).unwrap();
+        let side_one = height_block(genesis.hash, genesis.header.time + 2, 1);
+        let side_two = height_block(side_one.block_hash(), side_one.header.time + 1, 2);
+        headers
+            .append(
+                &[side_one.header, side_two.header],
+                u32::MAX,
+                &mut HeaderWorkBudget::default(),
+            )
+            .unwrap();
+        let winner = headers.snapshot().unwrap();
+        assert_eq!(original.active_tip().hash, first.block_hash());
+        assert_eq!(winner.active_tip().hash, side_two.block_hash());
+        let error = disconnect_execution_tip(&chainstate, &FailedRead(&winner), 2, 60).unwrap_err();
+        assert!(matches!(error, BlockExecutionError::HeaderRead(_)));
+        assert_eq!(
+            chainstate.execution().tip().unwrap().hash,
+            first.block_hash()
+        );
+        disconnect_execution_tip(&chainstate, &winner, 2, 60).unwrap();
+        connect_active_blocks(
+            &chainstate,
+            &winner,
+            &[side_one, side_two],
+            3,
+            60,
+            &[deployments(1), deployments(2)],
+        )
+        .unwrap();
+        assert_eq!(
+            chainstate.execution().tip().unwrap().hash,
+            winner.active_tip().hash
+        );
+        assert!(
+            chainstate
+                .undos()
+                .get(first.block_hash())
+                .unwrap()
+                .is_none()
+        );
+        let first_winner = winner.active_header(1).unwrap().unwrap().hash;
+        assert!(matches!(
+            chainstate.prune_block_undos_before(&FailedRead(&winner), 2),
+            Err(crate::chain_store::ChainStoreError::HeaderRead(_))
+        ));
+        assert!(chainstate.undos().get(first_winner).unwrap().is_some());
+        assert_eq!(chainstate.prune_block_undos_before(&winner, 2).unwrap(), 1);
+        assert!(chainstate.undos().get(first_winner).unwrap().is_none());
+        let mut policy = crate::ibd::IbdPolicy::for_network(Network::Regtest);
+        policy
+            .set_assume_valid(&winner.active_tip().hash.to_string())
+            .unwrap();
+        assert!(matches!(
+            policy.status(&FailedRead(&winner)),
+            Err(crate::ibd::IbdPolicyError::HeaderRead(_))
+        ));
+        let mut config = DeploymentConfig::for_network(Network::Regtest);
+        config
+            .apply_vbparams("taproot:0:9223372036854775807")
+            .unwrap();
+        assert!(matches!(
+            crate::deployments::taproot_active(&FailedRead(&winner), 144, &config),
+            Err(crate::deployments::DeploymentConfigError::HeaderRead(_))
+        ));
+    }
+
+    #[test]
     fn commits_a_multi_transaction_block_atomically() {
         let directory = TempDir::new().unwrap();
         let chainstate =
@@ -2676,6 +3208,343 @@ mod tests {
                 .is_some()
         );
         assert_eq!(chainstate.execution().tip().unwrap().height, 1);
+    }
+
+    #[test]
+    fn prefetch_memory_follows_refresh_overlay_and_detached_delta() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("prefetch.redb"), Network::Regtest).unwrap();
+        let key = OutPointKey::from(OutPoint::new(Txid::from_byte_array([71; 32]), 0));
+        let mut coin = Utxo {
+            value_sats: 42,
+            height: 1,
+            is_coinbase: false,
+            last_touched: 1,
+            creation_mtp: 0,
+            script_pubkey: vec![0x51],
+        };
+        store.apply(&[], &[(key, coin.clone())]).unwrap();
+        let baseline = budget.snapshot().used;
+        let mut prefetch = read_prefetch(&store, &[key]).unwrap();
+        let retained = budget.snapshot().used;
+        assert!(retained > baseline);
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        coin.script_pubkey.resize(4096, 0x51);
+        store.apply(&[key], &[(key, coin.clone())]).unwrap();
+        let occupied = budget.reserve(budget.snapshot().limit - retained).unwrap();
+        assert!(prefetch.refresh(&store).is_err());
+        assert_eq!(
+            prefetch.entries[0].1.as_ref().unwrap().script_pubkey.len(),
+            1
+        );
+        drop(occupied);
+        assert_eq!(budget.snapshot().used, retained);
+        prefetch.refresh(&store).unwrap();
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        let mut malformed = coin.clone();
+        malformed
+            .script_pubkey
+            .resize(crate::chainstate::MAX_SCRIPT_SIZE + 1, 0x51);
+        store.apply(&[key], &[(key, malformed)]).unwrap();
+        assert!(matches!(
+            prefetch.refresh(&store),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionRead(_)
+            ))
+        ));
+        assert_eq!(prefetch.entries[0].1.as_ref().unwrap(), &coin);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        prefetch.check_owner(&store).unwrap();
+        let unleased = ActiveBlockUtxoPrefetch {
+            entries: Vec::new(),
+            memory: Vec::new(),
+        };
+        assert!(unleased.check_owner(&store).is_err());
+        let other = crate::node_memory::MemoryBudget::new(1);
+        let foreign = ActiveBlockUtxoPrefetch {
+            entries: Vec::new(),
+            memory: vec![other.reserve(1).unwrap()],
+        };
+        assert!(foreign.check_owner(&store).is_err());
+        let overlay = UtxoOverlay::new(&store);
+        overlay.seed_prefetched(prefetch);
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        assert_eq!(overlay.get(key).unwrap().unwrap(), coin);
+        let delta = overlay.into_delta();
+        assert_eq!(budget.snapshot().used, retained + 4095);
+        drop(delta);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn prefetch_memory_late_chunk_exhaustion_refunds_partial_results() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("prefetch.redb"), Network::Regtest).unwrap();
+        let coins = (0..256)
+            .map(|vout| {
+                (
+                    OutPointKey::from(OutPoint::new(Txid::from_byte_array([72; 32]), vout)),
+                    Utxo {
+                        value_sats: 42,
+                        height: 1,
+                        is_coinbase: false,
+                        last_touched: 1,
+                        creation_mtp: 0,
+                        script_pubkey: vec![0x51; crate::chainstate::MAX_SCRIPT_SIZE],
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        store.apply(&[], &coins).unwrap();
+        let keys = coins.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let baseline = budget.snapshot().used;
+        let occupied = budget
+            .reserve(budget.snapshot().limit - baseline - 6 * 1024 * 1024)
+            .unwrap();
+        let before = budget.snapshot().used;
+        assert!(matches!(
+            read_prefetch(&store, &keys),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionMemory(_)
+            ))
+        ));
+        assert!(
+            budget.snapshot().peak > before + 5 * 1024 * 1024,
+            "first chunk obtained its read allowance"
+        );
+        assert_eq!(budget.snapshot().used, before);
+        drop(occupied);
+        let prefetch = read_prefetch(&store, &keys).unwrap();
+        assert_eq!(prefetch.entries.len(), coins.len());
+        assert!(
+            budget.snapshot().used > baseline + 256 * crate::chainstate::MAX_SCRIPT_SIZE as u64
+        );
+        drop(prefetch);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn preparation_admission_denies_before_allocating_and_follows_returned_undo() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chain.redb"), Network::Regtest).unwrap();
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let block = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .insert_contextual(block.header, block.header.time)
+            .unwrap();
+        let context = store.execution_spool().unwrap();
+        let baseline = budget.snapshot().used;
+        let needed = preparation_memory(&block).unwrap();
+        let occupied = budget
+            .reserve(budget.snapshot().limit - baseline - needed + 1)
+            .unwrap();
+        let prepare = || {
+            prepare_active_block_inner(
+                &store,
+                &headers,
+                &block,
+                store.execution_tip().unwrap(),
+                1,
+                &deployments(1),
+                false,
+                None,
+                Some(&context),
+            )
+        };
+        assert!(matches!(
+            prepare(),
+            Err(BlockExecutionError::ChainStore(
+                ChainStoreError::ExecutionMemory(_)
+            ))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - needed + 1);
+        assert_eq!(store.execution_tip().unwrap().height, 0);
+        drop(occupied);
+        let (prepared, delta, scripts) = prepare().unwrap();
+        assert!(scripts.is_empty());
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        let applied = prepared.into_applied(true);
+        let escaped = applied.transaction_undos.clone();
+        drop(delta);
+        drop(applied);
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        assert!(!escaped.is_empty());
+        drop(escaped);
+        assert_eq!(budget.snapshot().used, baseline);
+        let (prepared, delta, scripts) = prepare().unwrap();
+        drop(scripts);
+        assert!(prepared.into_applied(false).transaction_undos.is_empty());
+        assert_eq!(
+            budget.snapshot().used,
+            baseline + needed,
+            "delta still owns created coins"
+        );
+        let changes = delta.into_net_changes();
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        let transition = crate::chain_store::LeasedConnectTransition::with_shared_reservation(
+            ConnectTransition {
+                expected_parent: genesis.hash,
+                next: ExecutionTip {
+                    height: 1,
+                    hash: block.block_hash(),
+                },
+                spent: changes.spent,
+                created: changes.created,
+                transaction_undos: Vec::new(),
+            },
+            changes.memory.unwrap(),
+        );
+        assert_eq!(budget.snapshot().used, baseline + needed);
+        drop(transition);
+        assert_eq!(budget.snapshot().used, baseline);
+    }
+
+    #[test]
+    fn computed_batch_ids_hold_shared_memory_until_the_payload_drops() {
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let store =
+            RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
+                .unwrap();
+        let headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let mut block = height_block(genesis.hash, genesis.header.time + 1, 1);
+        // Exercise both the outer batch allocation and substantial inner arrays.
+        block.txdata.resize(4096, block.txdata[0].clone());
+        let blocks = [block.clone(), block];
+        let baseline = budget.snapshot().used;
+        let ids = ComputedBatchTransactionIds::new(&store, &blocks).unwrap();
+        for (computed, block) in ids.ids.iter().zip(&blocks) {
+            assert_eq!(computed.as_slice().len(), block.txdata.len());
+            for (id, tx) in computed.as_slice().iter().zip(&block.txdata) {
+                assert_eq!(*id, tx.compute_txid());
+            }
+        }
+        let retained = budget.snapshot().used - baseline;
+        assert!(retained >= 8192 * size_of::<Txid>() as u64);
+        let occupied = budget
+            .reserve(budget.snapshot().limit - budget.snapshot().used)
+            .unwrap();
+        assert!(matches!(
+            ComputedBatchTransactionIds::new(&store, &blocks),
+            Err(ChainStoreError::ExecutionMemory(_))
+        ));
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        drop(ids);
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit - retained);
+        let retried = ComputedBatchTransactionIds::new(&store, &blocks).unwrap();
+        assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        drop(retried);
+        drop(occupied);
+        assert_eq!(budget.snapshot().used, baseline);
+        assert_eq!(store.execution_tip().unwrap().height, 0);
+    }
+
+    #[test]
+    fn execution_spool_commits_through_write_back_and_releases_reservations() {
+        use crate::write_back_chainstate::{WriteBackChainstate, WriteBackLimits};
+        let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        let path = directory.path().join("chainstate.redb");
+        let store = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        let cache_used = budget.snapshot().used;
+        let store = WriteBackChainstate::new(
+            store,
+            WriteBackLimits {
+                max_batches: 10,
+                max_created: u64::MAX,
+            },
+        );
+        let mut headers = HeaderDag::new(Network::Regtest);
+        let genesis = headers.active_tip();
+        let first = height_block(genesis.hash, genesis.header.time + 1, 1);
+        headers
+            .insert_contextual(first.header, first.header.time)
+            .unwrap();
+        let second = height_block(first.block_hash(), first.header.time + 1, 2);
+        headers
+            .insert_contextual(second.header, second.header.time)
+            .unwrap();
+        let blocks = [first, second];
+        // Both indexed and non-indexed execution must obtain allocation
+        // allowances before workers or spool writes can begin.
+        let occupied = budget
+            .reserve(budget.snapshot().limit - cache_used)
+            .unwrap();
+        for applied_undos in [AppliedUndos::Keep, AppliedUndos::Drop] {
+            let result = connect_active_blocks_inner(
+                &store,
+                &headers,
+                &blocks,
+                1,
+                60,
+                &[deployments(1), deployments(2)],
+                false,
+                None,
+                None,
+                applied_undos,
+                None,
+            );
+            assert!(matches!(
+                result,
+                Err(BlockExecutionError::ChainStore(
+                    ChainStoreError::ExecutionMemory(_)
+                ))
+            ));
+            assert_eq!(store.execution_tip().unwrap().height, 0);
+            assert_eq!(store.pending_blocks(), 0);
+            assert_eq!(budget.spool_snapshot().peak, 0);
+            assert_eq!(budget.snapshot().used, budget.snapshot().limit);
+        }
+        drop(occupied);
+        let (applied, _) = connect_active_blocks_inner(
+            &store,
+            &headers,
+            &blocks,
+            1,
+            60,
+            &[deployments(1), deployments(2)],
+            false,
+            None,
+            None,
+            AppliedUndos::Drop,
+            None,
+        )
+        .unwrap();
+        assert_eq!(applied.len(), 2);
+        assert!(
+            applied
+                .iter()
+                .all(|block| block.transaction_undos.is_empty())
+        );
+        assert_eq!(store.execution_tip().unwrap().height, 2);
+        assert!(budget.spool_snapshot().peak > 0);
+        assert_eq!(budget.spool_snapshot().used, 0);
+        assert!(
+            budget.snapshot().used > cache_used,
+            "buffered decoded inputs retain reservations"
+        );
+        store.flush().unwrap();
+        assert_eq!(budget.snapshot().used, cache_used);
+        drop(store);
+        let reopened = RedbChainStore::open(&path, Network::Regtest).unwrap();
+        assert_eq!(reopened.execution_tip().unwrap().height, 2);
+        for block in blocks {
+            assert!(reopened.block_undo(block.block_hash()).unwrap().is_some());
+        }
     }
 
     #[test]
@@ -2759,16 +3628,27 @@ mod tests {
 
     #[test]
     fn ibd_checkpoint_defers_all_scripts_but_reports_the_earliest_block() {
-        assert_invalid_scripts_do_not_commit(false);
+        assert_invalid_scripts_do_not_commit(false, false);
     }
 
     #[test]
     fn replay_script_carry_cannot_commit_an_invalid_batch() {
-        assert_invalid_scripts_do_not_commit(true);
+        assert_invalid_scripts_do_not_commit(true, false);
     }
 
-    fn assert_invalid_scripts_do_not_commit(replay: bool) {
+    #[test]
+    fn execution_spool_script_failure_discards_all_results() {
+        assert_invalid_scripts_do_not_commit(true, true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_invalid_scripts_do_not_commit(replay: bool, spool: bool) {
         let directory = TempDir::new().unwrap();
+        let budget = crate::node_memory::MemoryBudget::new(2 * 1024 * 1024 * 1024);
+        if spool {
+            budget.bind(&[directory.path().to_path_buf()]).unwrap();
+        }
+
         let chainstate =
             RedbChainStore::open(directory.path().join("chainstate.redb"), Network::Regtest)
                 .unwrap();
@@ -2841,9 +3721,17 @@ mod tests {
             true,
             None,
             None,
-            AppliedUndos::Keep,
+            if spool {
+                AppliedUndos::Drop
+            } else {
+                AppliedUndos::Keep
+            },
             replay.then_some(&mut carry),
         );
+        if spool {
+            assert!(budget.spool_snapshot().peak > 0);
+            assert_eq!(budget.spool_snapshot().used, 0);
+        }
         assert!(matches!(
             result,
             Err(BlockExecutionError::Block(BlockError::Transaction {

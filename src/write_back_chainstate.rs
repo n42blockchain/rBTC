@@ -36,7 +36,7 @@ use crate::{
     OutPointKey, Utxo,
     chain_store::{ChainStoreError, ConnectTransition, ExecutionChainStore},
     execution_store::{ExecutionStoreError, ExecutionTip},
-    headers::HeaderDag,
+    headers::HeaderView,
     utxo::{TierStats, UtxoError, UtxoStore, UtxoUndo},
 };
 
@@ -90,6 +90,7 @@ struct Pending {
     tip: Option<ExecutionTip>,
     batches: u32,
     cancelled: u64,
+    leases: Vec<Arc<crate::node_memory::MemoryLease>>,
 }
 
 impl Pending {
@@ -104,6 +105,7 @@ struct Committed {
     created: AHashMap<OutPointKey, Utxo>,
     spent: AHashSet<OutPointKey>,
     tip: ExecutionTip,
+    leases: Vec<Arc<crate::node_memory::MemoryLease>>,
 }
 
 type FlushResult = Result<WriteBackFlush, ChainStoreError>;
@@ -311,6 +313,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             let tip = taken.tip.expect("non-empty buffer has a tip");
             (
                 Arc::new(Committed {
+                    leases: taken.leases,
                     transitions: taken.transitions,
                     created: taken.created,
                     spent: taken.spent,
@@ -324,6 +327,14 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
         let thread_state = Arc::clone(&state);
         let handle = spawn(Box::new(move || {
             let started = Instant::now();
+            // Sorting currently copies folded coins. Reserve before cloning;
+            // keep the original payload allowance with the readable buffer.
+            let _copy_leases = thread_state
+                .leases
+                .iter()
+                .map(|lease| lease.duplicate())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(UtxoError::from)?;
             // The buffered transitions no longer carry their coins; the
             // maps are the batch's folded net change, sorted for the
             // engine's single write pass.
@@ -347,10 +358,15 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
             })
         }));
         let Ok(handle) = handle else {
+            // A failed spawn dropped its closure; the unpublished state has no
+            // other owner. Move it back without cloning an entire buffer.
+            let state = Arc::try_unwrap(state)
+                .unwrap_or_else(|_| unreachable!("failed spawn retained work"));
             *pending = Pending {
-                transitions: state.transitions.clone(),
-                created: state.created.clone(),
-                spent: state.spent.clone(),
+                leases: state.leases,
+                transitions: state.transitions,
+                created: state.created,
+                spent: state.spent,
                 tip: Some(state.tip),
                 batches,
                 cancelled,
@@ -484,8 +500,18 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
 
     /// Buffers one contiguous batch, starting a background flush afterwards
     /// if a limit is hit.
-    fn buffer(&self, mut transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
-        if transitions.is_empty() {
+    fn buffer(&self, transitions: Vec<ConnectTransition>) -> Result<(), ChainStoreError> {
+        self.buffer_with_leases(crate::chain_store::CollectedTransitions {
+            transitions,
+            leases: Vec::new(),
+        })
+    }
+
+    fn buffer_with_leases(
+        &self,
+        mut collected: crate::chain_store::CollectedTransitions,
+    ) -> Result<(), ChainStoreError> {
+        if collected.transitions.is_empty() {
             return Ok(());
         }
         self.check_failed()?;
@@ -513,7 +539,7 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
                         .as_ref()
                         .is_some_and(|state| state.spent.contains(key))
             };
-            for transition in &mut transitions {
+            for transition in &mut collected.transitions {
                 if transition.expected_parent != tip.hash
                     || tip.height.checked_add(1) != Some(transition.next.height)
                 {
@@ -566,7 +592,8 @@ impl<C: ExecutionChainStore + 'static> WriteBackChainstate<C> {
                 .cancelled
                 .saturating_add(u64::try_from(staged_cancelled.len()).unwrap_or(u64::MAX));
             pending.spent.extend(staged_spent);
-            pending.transitions.extend(transitions);
+            pending.transitions.extend(collected.transitions);
+            pending.leases.extend(collected.leases);
             pending.tip = Some(tip);
             pending.batches = pending.batches.saturating_add(1);
             let created = u64::try_from(pending.created.len()).unwrap_or(u64::MAX);
@@ -758,6 +785,10 @@ impl<C: ExecutionChainStore + 'static> UtxoStore for WriteBackChainstate<C> {
 }
 
 impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainstate<C> {
+    fn execution_spool(&self) -> Option<crate::execution_spool::ExecutionSpoolContext> {
+        self.inner.execution_spool()
+    }
+
     fn execution_tip(&self) -> Result<ExecutionTip, ChainStoreError> {
         let pending = self.read();
         let in_flight = self.in_flight_state();
@@ -844,6 +875,17 @@ impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainsta
         self.buffer(transitions)
     }
 
+    fn commit_connect_batch_stream(
+        &self,
+        transitions: &mut dyn ExactSizeIterator<
+            Item = Result<crate::chain_store::LeasedConnectTransition, ChainStoreError>,
+        >,
+        final_tip: Option<ExecutionTip>,
+    ) -> Result<(), ChainStoreError> {
+        let collected = crate::chain_store::collect_transition_stream(transitions, final_tip)?;
+        self.buffer_with_leases(collected)
+    }
+
     fn commit_disconnect(
         &self,
         expected_current: ExecutionTip,
@@ -859,7 +901,7 @@ impl<C: ExecutionChainStore + 'static> ExecutionChainStore for WriteBackChainsta
 
     fn prune_block_undos_before(
         &self,
-        headers: &HeaderDag,
+        headers: &dyn HeaderView,
         retain_from_height: u32,
     ) -> Result<u64, ChainStoreError> {
         // Buffered undo belongs to the newest blocks, which sit above any
@@ -1328,5 +1370,94 @@ mod tests {
         let expected = vec![(key(1), None), (key(2), Some(coin(6)))];
         assert_eq!(prefetched, expected);
         assert_eq!(durable_prefetch, expected);
+    }
+    #[test]
+    fn leased_stream_stays_charged_through_spawn_failure_and_flush() {
+        let dir = TempDir::new().unwrap();
+        let inner = open(&dir, "leased.redb");
+        let genesis = inner.execution_tip().unwrap();
+        let store = WriteBackChainstate::new(
+            inner,
+            WriteBackLimits {
+                max_batches: 10,
+                max_created: u64::MAX,
+            },
+        );
+        let budget = crate::node_memory::MemoryBudget::new(200);
+        let lease = budget.reserve(100).unwrap();
+        let item = crate::chain_store::LeasedConnectTransition::with_reservation(
+            transition(genesis, tip(1), vec![], vec![(key(1), coin(5))]),
+            lease,
+        );
+        store
+            .commit_connect_batch_stream(&mut vec![Ok(item)].into_iter(), Some(tip(1)))
+            .unwrap();
+        assert_eq!(budget.snapshot().used, 100);
+        assert_eq!(store.inner().execution_tip().unwrap(), genesis);
+        assert!(
+            store
+                .start_flush_with_spawn(|_| Err(std::io::Error::other("spawn failure")))
+                .is_err()
+        );
+        assert_eq!(budget.snapshot().used, 100);
+        assert_eq!(store.get(key(1)).unwrap(), Some(coin(5)));
+        store.flush().unwrap();
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(budget.snapshot().peak, 200);
+        assert_eq!(store.inner().execution_tip().unwrap(), tip(1));
+    }
+
+    #[test]
+    fn leased_stream_copy_exhaustion_keeps_failed_buffer_charged() {
+        let dir = TempDir::new().unwrap();
+        let inner = open(&dir, "exhausted.redb");
+        let genesis = inner.execution_tip().unwrap();
+        let store = WriteBackChainstate::new(
+            inner,
+            WriteBackLimits {
+                max_batches: 10,
+                max_created: u64::MAX,
+            },
+        );
+        let budget = crate::node_memory::MemoryBudget::new(100);
+        let item = crate::chain_store::LeasedConnectTransition::with_reservation(
+            transition(genesis, tip(1), vec![], vec![(key(1), coin(5))]),
+            budget.reserve(100).unwrap(),
+        );
+        store
+            .commit_connect_batch_stream(&mut vec![Ok(item)].into_iter(), Some(tip(1)))
+            .unwrap();
+        assert!(store.flush().is_err());
+        assert_eq!(budget.snapshot().used, 100);
+        assert_eq!(store.get(key(1)).unwrap(), Some(coin(5)));
+        assert_eq!(store.inner().execution_tip().unwrap(), genesis);
+        drop(store);
+        assert_eq!(budget.snapshot().used, 0);
+    }
+
+    #[test]
+    fn late_leased_source_failure_does_not_enter_writeback() {
+        let dir = TempDir::new().unwrap();
+        let inner = open(&dir, "source-error.redb");
+        let genesis = inner.execution_tip().unwrap();
+        let store = WriteBackChainstate::new(inner, WriteBackLimits::PASS_THROUGH);
+        let budget = crate::node_memory::MemoryBudget::new(100);
+        let item = crate::chain_store::LeasedConnectTransition::with_reservation(
+            transition(genesis, tip(1), vec![], vec![(key(1), coin(5))]),
+            budget.reserve(100).unwrap(),
+        );
+        let mut stream = vec![
+            Ok(item),
+            Err(UtxoError::Malformed("spool read failed").into()),
+        ]
+        .into_iter();
+        assert!(
+            store
+                .commit_connect_batch_stream(&mut stream, Some(tip(2)))
+                .is_err()
+        );
+        assert_eq!(budget.snapshot().used, 0);
+        assert_eq!(store.pending_blocks(), 0);
+        assert_eq!(store.execution_tip().unwrap(), genesis);
     }
 }
