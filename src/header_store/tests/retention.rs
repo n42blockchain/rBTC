@@ -220,3 +220,61 @@ fn legacy_reverse_index_is_migrated_atomically_on_first_eviction() {
         3
     );
 }
+
+#[test]
+fn eviction_candidates_are_leaf_first_lowest_chainwork_and_respect_caps_and_pins() {
+    let (mut dag, active, side) = branches();
+    // Already within the cap: nothing is selected.
+    assert!(dag.select_side_chain_eviction_candidates(&[], 2).is_empty());
+    assert!(dag.select_side_chain_eviction_candidates(&[], 5).is_empty());
+
+    // Only the present leaf (side[1], the child of side[0]) is eligible while
+    // side[0] still has a retained child.
+    assert_eq!(
+        dag.select_side_chain_eviction_candidates(&[], 1),
+        vec![side[1].block_hash()]
+    );
+
+    // Pinning the only current leaf must not expose its non-leaf parent.
+    assert!(
+        dag.select_side_chain_eviction_candidates(&[side[1].block_hash()], 0)
+            .is_empty()
+    );
+
+    // Leaf-first walk: evicting side[1] exposes side[0] in the same pass.
+    let selected = dag.select_side_chain_eviction_candidates(&[], 0);
+    assert_eq!(selected, vec![side[1].block_hash(), side[0].block_hash()]);
+    for hash in selected {
+        assert!(active.iter().all(|header| header.block_hash() != hash));
+        assert_ne!(hash, dag.active_tip().hash);
+    }
+
+    // Pinning a side-chain hash never active-height-protected is still honored.
+    let selected = dag.select_side_chain_eviction_candidates(&[side[0].block_hash()], 0);
+    assert_eq!(selected, vec![side[1].block_hash()]);
+}
+
+#[test]
+fn eviction_candidates_break_chainwork_ties_by_ascending_hash() {
+    let mut dag = HeaderDag::new(Network::Regtest);
+    let genesis = dag.active_tip();
+    // Two active-chain headers keep every sibling below strictly below the
+    // active tip's chainwork, so none of them can ever be promoted.
+    let mut parent = genesis;
+    for _ in 0..2 {
+        let header = mine_child(parent.hash, parent.header.time + 1);
+        parent = dag.insert_contextual(header, header.time).unwrap();
+    }
+    // `mine_child` always mines at the fixed regtest minimum difficulty, so
+    // three siblings off genesis carry identical chainwork; only their hash
+    // breaks the tie.
+    let mut siblings: Vec<Header> = (0..3)
+        .map(|offset| mine_child(genesis.hash, genesis.header.time + 100 + offset))
+        .collect();
+    for header in &siblings {
+        dag.insert_contextual(*header, header.time).unwrap();
+    }
+    siblings.sort_by_key(|header| header.block_hash().to_byte_array());
+    let expected: Vec<BlockHash> = siblings.iter().map(Header::block_hash).collect();
+    assert_eq!(dag.select_side_chain_eviction_candidates(&[], 0), expected);
+}
