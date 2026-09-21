@@ -105,7 +105,12 @@ fn rejection_and_pool_clones_cannot_reset_the_shared_allowance() {
     let (_directory, store) = store();
     let (_, _, tx) = spend(1);
     let limits = AdmissionResourceLimits {
-        work_burst: 10_000_000,
+        // Comfortably above the candidate's own conservative worst-case
+        // estimate (dominated by the flat
+        // `MAX_STANDARD_TRANSACTION_SIGOP_COST` sigop bound charged for a
+        // not-yet-validated transaction), so the up-front gate's total
+        // capacity check passes and only the drained allowance below defers.
+        work_burst: 200_000_000,
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
     };
@@ -235,6 +240,61 @@ fn prevout_precharge_defers_before_any_base_store_lookup() {
 }
 
 #[test]
+fn sigop_worst_case_bound_defers_up_front_without_store_lookups() {
+    let (_directory, store) = store();
+    let (outpoint, utxo, tx) = spend(1);
+    store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
+    let counting = CountingStore::new(&store);
+    // The candidate's own conservative worst-case estimate, computed the
+    // same way `candidate_work_estimate` does for a not-yet-validated
+    // transaction: it now includes `MAX_STANDARD_TRANSACTION_SIGOP_COST`'s
+    // Script-stage charge, since the real sigop cost is unknown before
+    // prevout resolution.
+    let sigop_worst_case = MAX_STANDARD_TRANSACTION_SIGOP_COST.saturating_mul(10_000);
+    let estimate = 1
+        + payload_traversal_charge(&tx)
+        + payload_bytes_charge(&tx)
+        + apply_to_overlay_estimate(&tx, None)
+        + 4 * 1024 * 1024
+        + graph_charge_estimate(0, 1);
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        // Exactly the candidate's own worst-case estimate, so the up-front
+        // total-capacity check passes and only the drained allowance below
+        // decides whether it defers.
+        work_burst: estimate,
+        work_per_second: 0,
+        candidate_bytes: 16 * 1024 * 1024,
+    });
+    // Drain exactly the sigop worst-case term: the remaining allowance
+    // covers every other up-front charge (payload, metadata, graph, prevout
+    // preparation and precharge, script bytes) but not the Script stage's
+    // `MAX_STANDARD_TRANSACTION_SIGOP_COST` bound this not-yet-validated
+    // candidate has not proven it stays under. Before this bound was added
+    // to the estimate, this exact allowance wrongly admitted the candidate.
+    budget
+        .charge(AdmissionStage::Graph, sigop_worst_case)
+        .unwrap();
+    let before = budget.snapshot();
+    let mut pool = TransactionAdmissionPool::default().with_admission_budget(budget.clone());
+    let error = pool.admit(&counting, tx, context()).unwrap_err();
+    assert!(matches!(
+        error,
+        TransactionAdmissionError::ResourceDeferred(_)
+    ));
+    assert_eq!(
+        counting.get_calls(),
+        0,
+        "the up-front gate defers before any base-store lookup"
+    );
+    let after = budget.snapshot();
+    assert_eq!(
+        after.charged, before.charged,
+        "no stage charge runs before the up-front gate defers"
+    );
+    assert!(pool.is_empty());
+}
+
+#[test]
 fn prevout_script_clone_is_charged_under_script_stage() {
     let (_directory, store) = store();
     let (outpoint, utxo, tx) = spend(1);
@@ -258,11 +318,19 @@ fn oversized_candidate_is_permanently_refused_while_a_normal_one_still_admits() 
     let (outpoint, utxo, normal_tx) = spend(1);
     store.apply(&[], &[(outpoint.into(), utxo)]).unwrap();
     let limits = AdmissionResourceLimits {
-        // Large enough for the fixed ~4 MiB candidate-metadata charge plus a
-        // single normal input, but smaller than 200 inputs' worst-case
-        // prevout precharge (200 * 30_087 = 6_017_400), which can never fit
-        // regardless of refill.
-        work_burst: 6_000_000,
+        // Exactly the normal one-input candidate's own conservative
+        // worst-case estimate (dominated by the flat
+        // `MAX_STANDARD_TRANSACTION_SIGOP_COST` sigop bound charged for a
+        // not-yet-validated transaction, plus the fixed ~4 MiB
+        // candidate-metadata charge). 200 inputs' extra prevout precharge and
+        // script-byte bound push the oversized candidate's own estimate past
+        // this same ceiling, so it can never fit regardless of refill.
+        work_burst: 1
+            + payload_traversal_charge(&normal_tx)
+            + payload_bytes_charge(&normal_tx)
+            + apply_to_overlay_estimate(&normal_tx, None)
+            + 4 * 1024 * 1024
+            + graph_charge_estimate(0, 1),
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
     };
@@ -296,9 +364,11 @@ fn a_candidate_below_its_estimate_defers_atomically_then_admits_after_refill() {
     let counting = CountingStore::new(&store);
     let limits = AdmissionResourceLimits {
         // Comfortably above this one-input candidate's conservative
-        // worst-case estimate (dominated by the ~4 MiB metadata charge),
-        // so the candidate fits the ledger's total capacity.
-        work_burst: 10_000_000,
+        // worst-case estimate (dominated by the flat
+        // `MAX_STANDARD_TRANSACTION_SIGOP_COST` sigop bound charged for a
+        // not-yet-validated transaction), so the candidate fits the ledger's
+        // total capacity.
+        work_burst: 200_000_000,
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
     };
@@ -342,7 +412,12 @@ fn repeated_deferrals_never_drain_the_ledger() {
     let (_directory, store) = store();
     let (_, _, tx) = spend(1);
     let limits = AdmissionResourceLimits {
-        work_burst: 10_000_000,
+        // Comfortably above the candidate's own conservative worst-case
+        // estimate (dominated by the flat
+        // `MAX_STANDARD_TRANSACTION_SIGOP_COST` sigop bound charged for a
+        // not-yet-validated transaction), so the up-front gate's total
+        // capacity check passes and only the drained allowance below defers.
+        work_burst: 200_000_000,
         work_per_second: 0,
         candidate_bytes: 16 * 1024 * 1024,
     };
