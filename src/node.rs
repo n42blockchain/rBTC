@@ -73,7 +73,7 @@ use crate::snapshot_overlay::{SnapshotOverlayChainstate, SnapshotOverlayConfig};
 #[cfg(feature = "mdbx")]
 use crate::snapshot_overlay_redb::SnapshotOverlayRedbChainstate;
 use bitcoin::{
-    Block, BlockHash, Network, OutPoint, Transaction, Txid,
+    Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid,
     block::Header,
     consensus::{deserialize, serialize},
     hashes::Hash,
@@ -5565,8 +5565,8 @@ impl InboundDataSource for SharedInboundSource {
         self.current()?.block(hash)
     }
 
-    fn mempool(&self) -> Result<Vec<Transaction>, String> {
-        self.current()?.mempool()
+    fn mempool(&self, limit: usize) -> Result<Vec<(Txid, Wtxid)>, String> {
+        self.current()?.mempool(limit)
     }
 
     fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
@@ -5899,12 +5899,12 @@ impl InboundDataSource for NodeInboundSource {
         Ok(raw)
     }
 
-    fn mempool(&self) -> Result<Vec<Transaction>, String> {
+    fn mempool(&self, limit: usize) -> Result<Vec<(Txid, Wtxid)>, String> {
         Ok(self
             .transaction_pool
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .snapshot())
+            .inventory_ids(limit))
     }
 
     fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
@@ -19467,7 +19467,7 @@ mod tests {
             Ok((hash == self.block.block_hash()).then(|| serialize(&self.block)))
         }
 
-        fn mempool(&self) -> Result<Vec<Transaction>, String> {
+        fn mempool(&self, _limit: usize) -> Result<Vec<(Txid, Wtxid)>, String> {
             Ok(Vec::new())
         }
 

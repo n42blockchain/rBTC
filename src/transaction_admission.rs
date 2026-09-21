@@ -597,10 +597,11 @@ impl TransactionAdmissionPool {
     /// `sigop_cost` is reused, which is a true bound (it cannot regress on
     /// replay of the same transaction against an unchanged overlay). For a
     /// brand-new, not-yet-validated transaction the witness/P2SH sigop cost
-    /// is only knowable after prevout resolution, so this estimate omits it;
-    /// an adversarial candidate with an unusually high sigop cost can still
-    /// exhaust the ledger mid-pipeline exactly as before this change, only
-    /// for that narrow case (see module docs for the accepted trade-off).
+    /// is only knowable after prevout resolution, so this estimate charges
+    /// the worst case a standard transaction can ever carry,
+    /// `MAX_STANDARD_TRANSACTION_SIGOP_COST`: anything above that bound is
+    /// rejected as non-standard regardless of resource accounting, so it can
+    /// never actually reach the Script stage's real sigop charge.
     fn candidate_work_estimate(&self, transactions: &[Transaction]) -> u64 {
         let mut total = u64::try_from(transactions.len()).unwrap_or(u64::MAX);
         for transaction in transactions {
@@ -1253,6 +1254,23 @@ impl TransactionAdmissionPool {
         self.entries
             .iter()
             .map(|entry| (*entry.transaction).clone())
+            .collect()
+    }
+
+    /// Oldest-to-newest admitted `(txid, wtxid)` pairs, capped at `limit`.
+    ///
+    /// Every entry's identifiers were computed once on admission and stored
+    /// alongside it, so this answers a `mempool` inventory request without
+    /// cloning or rehashing any retained transaction.
+    #[must_use]
+    pub fn inventory_ids(&self, limit: usize) -> Vec<(Txid, Wtxid)> {
+        if self.validation_pending {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .take(limit)
+            .map(|entry| (entry.txid, entry.wtxid))
             .collect()
     }
 
@@ -2745,12 +2763,16 @@ fn prevout_precharge_amount(transaction: &Transaction) -> u64 {
 /// at zero whenever every prevout script is within `MAX_SCRIPT_SIZE`, the
 /// only case a stored coin can ever be in) plus the Script stage's sigop and
 /// script-byte-clone charges. `sigop_cost_bound` is `None` when the real
-/// cost is not yet known (a not-yet-validated transaction); see
-/// `TransactionAdmissionPool::candidate_work_estimate` for why that is safe.
+/// cost is not yet known (a not-yet-validated transaction); the estimate
+/// then charges `MAX_STANDARD_TRANSACTION_SIGOP_COST`, the worst case any
+/// standard transaction can carry, since a higher exact cost is rejected as
+/// non-standard before it ever reaches the Script stage.
 fn apply_to_overlay_estimate(transaction: &Transaction, sigop_cost_bound: Option<u64>) -> u64 {
     let input_count = u64::try_from(transaction.input.len()).unwrap_or(u64::MAX);
     let script_bytes_bound = input_count.saturating_mul(MAX_SCRIPT_SIZE as u64);
-    let sigop_charge = sigop_cost_bound.unwrap_or(0).saturating_mul(10_000);
+    let sigop_charge = sigop_cost_bound
+        .unwrap_or(MAX_STANDARD_TRANSACTION_SIGOP_COST)
+        .saturating_mul(10_000);
     prevout_preparation_charge(transaction)
         .saturating_add(prevout_precharge_amount(transaction))
         .saturating_add(sigop_charge)

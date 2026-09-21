@@ -919,6 +919,7 @@ pub struct InboundPeerSession<S> {
     local_id: u64,
     remote_version: VersionMessage,
     wtxid_relay: bool,
+    mempool_served: bool,
 }
 
 impl<S> InboundPeerSession<S> {
@@ -944,6 +945,20 @@ impl<S> InboundPeerSession<S> {
     #[must_use]
     pub const fn addrv2_relay(&self) -> bool {
         self.transport.peer_addrv2
+    }
+
+    /// Returns whether this connection has already been served a `mempool` inventory.
+    #[must_use]
+    pub const fn mempool_served(&self) -> bool {
+        self.mempool_served
+    }
+
+    /// Marks this connection as having served a `mempool` inventory.
+    ///
+    /// `mempool` enumerates the whole retained pool; the inbound service
+    /// honors it at most once per connection, so later requests are ignored.
+    pub fn mark_mempool_served(&mut self) {
+        self.mempool_served = true;
     }
 }
 
@@ -3138,6 +3153,7 @@ pub async fn accept_inbound(
         transport,
         local_id: next_session_id(),
         remote_version,
+        mempool_served: false,
     })
 }
 

@@ -86,7 +86,10 @@ fn inbound_projection_hides_unexecuted_headers_and_rejects_mismatched_ledger_rec
         Some(serialize(&first))
     );
     assert!(shared.block(next.block_hash()).unwrap().is_none());
-    assert_eq!(shared.mempool().unwrap(), vec![transaction.clone()]);
+    assert_eq!(
+        shared.mempool(usize::MAX).unwrap(),
+        vec![(transaction.compute_txid(), transaction.compute_wtxid())]
+    );
     for inventory in [
         Inventory::Transaction(transaction.compute_txid()),
         Inventory::WitnessTransaction(transaction.compute_txid()),
@@ -156,5 +159,5 @@ fn inbound_projection_hides_unexecuted_headers_and_rejects_mismatched_ledger_rec
     assert_eq!(shared.start_height().unwrap(), 1);
     drop(replacement_lease);
     assert!(shared.start_height().is_err());
-    assert!(shared.mempool().is_err());
+    assert!(shared.mempool(usize::MAX).is_err());
 }

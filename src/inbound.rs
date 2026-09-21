@@ -514,8 +514,8 @@ pub trait InboundDataSource: Send + Sync + 'static {
     fn active_height(&self, hash: BlockHash) -> Result<Option<u32>, String>;
     /// Consensus-serialized retained active block by hash.
     fn block(&self, hash: BlockHash) -> Result<Option<Vec<u8>>, String>;
-    /// Bounded current mempool snapshot.
-    fn mempool(&self) -> Result<Vec<Transaction>, String>;
+    /// Oldest-to-newest current mempool inventory identifiers, capped at `limit`.
+    fn mempool(&self, limit: usize) -> Result<Vec<(Txid, Wtxid)>, String>;
     /// Current mempool transaction matching one supported inventory key.
     fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String>;
     /// Queues one untrusted peer transaction for the node's ordinary admission path.
@@ -1725,15 +1725,23 @@ async fn serve_mempool(
     upload: &UploadBudget,
     account: &InboundPeerAccount,
 ) -> Result<(), InboundError> {
-    let mut transactions = source.mempool().map_err(InboundError::Data)?;
-    transactions.truncate(MAX_INVENTORY_ENTRIES);
-    let inventory = transactions
+    // `mempool` enumerates the whole retained pool; honoring it repeatedly
+    // lets any inbound peer force repeated pool encoding for free. Serve it
+    // at most once per connection and otherwise ignore the request silently.
+    if peer.mempool_served() {
+        return Ok(());
+    }
+    peer.mark_mempool_served();
+    let ids = source
+        .mempool(MAX_INVENTORY_ENTRIES)
+        .map_err(InboundError::Data)?;
+    let inventory = ids
         .into_iter()
-        .map(|transaction| {
+        .map(|(txid, wtxid)| {
             if peer.wtxid_relay() {
-                Inventory::WTx(transaction.compute_wtxid())
+                Inventory::WTx(wtxid)
             } else {
-                Inventory::Transaction(transaction.compute_txid())
+                Inventory::Transaction(txid)
             }
         })
         .collect();
@@ -1951,12 +1959,15 @@ mod tests {
             Ok((hash == self.block.block_hash()).then(|| serialize(&self.block)))
         }
 
-        fn mempool(&self) -> Result<Vec<Transaction>, String> {
+        fn mempool(&self, limit: usize) -> Result<Vec<(Txid, Wtxid)>, String> {
             Ok(self
                 .available
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone())
+                .iter()
+                .take(limit)
+                .map(|transaction| (transaction.compute_txid(), transaction.compute_wtxid()))
+                .collect())
         }
 
         fn transaction(&self, inventory: Inventory) -> Result<Option<Transaction>, String> {
@@ -2536,6 +2547,83 @@ mod tests {
         assert_eq!(stats.snapshot().completed_total, 1);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn mempool_is_served_at_most_once_per_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = Arc::new(GenesisSource::new());
+        let mut first = source.block.txdata[0].clone();
+        first.input[0].previous_output.vout = 1;
+        let mut second = source.block.txdata[0].clone();
+        second.input[0].previous_output.vout = 2;
+        source
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([first.clone(), second.clone()]);
+        let service_source: Arc<dyn InboundDataSource> = source.clone();
+        let task = tokio::spawn(run_listener(
+            listener,
+            Network::Regtest.magic(),
+            2,
+            "/rbtcd:mempool-once-test/".to_owned(),
+            ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS,
+            InboundLimits::default(),
+            service_source,
+        ));
+        let mut peer = connect_outbound(
+            address,
+            Network::Regtest.magic(),
+            1,
+            "/rbtcd:mempool-once-client/".to_owned(),
+            0,
+        )
+        .await
+        .unwrap();
+        // Drain the post-handshake keepalive-class messages (e.g.
+        // `SendHeaders`) through the higher-level API before switching to
+        // the raw transport used to exercise the untyped mempool exchange.
+        peer.ping(1).await.unwrap();
+        let mut transport = peer.into_test_transport();
+
+        transport
+            .write_message(NetworkMessage::MemPool)
+            .await
+            .unwrap();
+        let inventory = match transport.read_message().await.unwrap() {
+            NetworkMessage::Inv(inventory) => inventory,
+            other => panic!("expected Inv, got {other:?}"),
+        };
+        // Inv content matches the pool's ids, oldest-to-newest, as wtxids
+        // because the outbound test client negotiates BIP339 wtxid relay.
+        assert_eq!(
+            inventory,
+            vec![
+                Inventory::WTx(first.compute_wtxid()),
+                Inventory::WTx(second.compute_wtxid()),
+            ]
+        );
+
+        // A second `mempool` request on the same connection is ignored: no
+        // Inv is queued for it. A ping sent right after it still gets an
+        // immediate pong, proving nothing was silently queued ahead of it.
+        transport
+            .write_message(NetworkMessage::MemPool)
+            .await
+            .unwrap();
+        transport
+            .write_message(NetworkMessage::Ping(77))
+            .await
+            .unwrap();
+        assert!(matches!(
+            transport.read_message().await.unwrap(),
+            NetworkMessage::Pong(77)
+        ));
+
+        drop(transport);
+        task.abort();
     }
 
     #[tokio::test]

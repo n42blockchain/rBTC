@@ -153,14 +153,16 @@ fn dry_run_resource_deferral_is_an_error_not_an_invalid_transaction_verdict() {
     transaction.input[0].previous_output = funding;
 
     // A temporarily insufficient allowance: comfortably above the
-    // candidate's worst-case estimate in total capacity, but drained by
+    // candidate's worst-case estimate in total capacity (which is now
+    // dominated by the flat `MAX_STANDARD_TRANSACTION_SIGOP_COST` sigop
+    // bound charged for a not-yet-validated transaction), but drained by
     // prior ledger activity to just past `dry_run_admission`'s own payload
     // charge and `admission_candidate`'s metadata reservation. The
     // up-front gate inside `admit_package_at` then defers (retryable)
     // rather than refusing the candidate outright.
     let bytes_charge = u64::try_from(transaction.total_size()).unwrap() * 2;
     let metadata_charge = 4 * 1024 * 1024_u64;
-    let work_burst = 20_000_000_u64;
+    let work_burst = 200_000_000_u64;
     let deferred_budget = AdmissionBudget::new(AdmissionResourceLimits {
         work_burst,
         work_per_second: 0,

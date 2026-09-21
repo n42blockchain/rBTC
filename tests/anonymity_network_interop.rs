@@ -522,7 +522,7 @@ impl rbtc::inbound::InboundDataSource for GenesisOnlySource {
         Ok((hash == self.block.block_hash()).then(|| bitcoin::consensus::serialize(&self.block)))
     }
 
-    fn mempool(&self) -> Result<Vec<bitcoin::Transaction>, String> {
+    fn mempool(&self, _limit: usize) -> Result<Vec<(bitcoin::Txid, bitcoin::Wtxid)>, String> {
         Ok(Vec::new())
     }
 
