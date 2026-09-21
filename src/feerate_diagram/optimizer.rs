@@ -559,4 +559,167 @@ mod tests {
         )
         .unwrap();
     }
+
+    // Deterministic 64-entry worst-case shapes and fee patterns, chosen to
+    // stress the closure search's structural assumptions rather than rely on
+    // random coverage: every generator below places each parent strictly
+    // before its child, so the identity order `0..COUNT` is always a valid
+    // (if naive) topological baseline.
+    const ADVERSARIAL_COUNT: usize = 64;
+
+    /// One parent per entry: the deepest possible dependency chain.
+    fn chain_parents(count: usize) -> Vec<Vec<usize>> {
+        (0..count)
+            .map(|i| if i == 0 { vec![] } else { vec![i - 1] })
+            .collect()
+    }
+
+    /// Every earlier transaction is a parent of every later one.
+    fn complete_dag_parents(count: usize) -> Vec<Vec<usize>> {
+        (0..count).map(|i| (0..i).collect()).collect()
+    }
+
+    /// A single sink transaction depends on every other transaction.
+    fn fan_in_parents(count: usize) -> Vec<Vec<usize>> {
+        (0..count)
+            .map(|i| if i + 1 == count { (0..i).collect() } else { vec![] })
+            .collect()
+    }
+
+    /// A single source transaction is the sole parent of every other one.
+    fn fan_out_parents(count: usize) -> Vec<Vec<usize>> {
+        (0..count)
+            .map(|i| if i == 0 { vec![] } else { vec![0] })
+            .collect()
+    }
+
+    /// Two equal layers, every second-layer entry depending on the entire
+    /// first layer.
+    fn layered_bipartite_parents(count: usize) -> Vec<Vec<usize>> {
+        let half = count / 2;
+        (0..count)
+            .map(|i| if i < half { vec![] } else { (0..half).collect() })
+            .collect()
+    }
+
+    /// Alternating high/low feerates (sawtooth), defeating rate estimates
+    /// that assume local monotonicity.
+    fn sawtooth_fees(count: usize) -> Vec<FeeFrac> {
+        (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    FeeFrac::new(1000, 10)
+                } else {
+                    FeeFrac::new(10, 10)
+                }
+            })
+            .collect()
+    }
+
+    /// Every entry has the exact same feerate, so no split is provably better
+    /// than any other and every subset ties.
+    fn equal_feerate_fees(count: usize) -> Vec<FeeFrac> {
+        (0..count)
+            .map(|i| {
+                let size = i32::try_from(i + 1).unwrap();
+                FeeFrac::new(500 * i64::from(size), size)
+            })
+            .collect()
+    }
+
+    /// Feerate strictly decreases with topological index, so merging any
+    /// prefix with its successor always lowers the rate: this defeats a
+    /// naive ancestor-greedy heuristic that would otherwise just walk the
+    /// topological order forward.
+    fn descending_by_topology_fees(count: usize) -> Vec<FeeFrac> {
+        (0..count)
+            .map(|i| FeeFrac::new(i64::try_from(count - i).unwrap() * 100, 10))
+            .collect()
+    }
+
+    type ShapeFn = fn(usize) -> Vec<Vec<usize>>;
+    type FeeFn = fn(usize) -> Vec<FeeFrac>;
+
+    const SHAPES: &[(&str, ShapeFn)] = &[
+        ("long_chain", chain_parents),
+        ("complete_dag", complete_dag_parents),
+        ("wide_fan_in", fan_in_parents),
+        ("wide_fan_out", fan_out_parents),
+        ("layered_bipartite", layered_bipartite_parents),
+    ];
+
+    const FEE_PATTERNS: &[(&str, FeeFn)] = &[
+        ("sawtooth", sawtooth_fees),
+        ("all_equal_feerate", equal_feerate_fees),
+        ("descending_by_topology", descending_by_topology_fees),
+    ];
+
+    #[test]
+    fn adversarial_shapes_respect_budget_and_never_worsen_the_baseline() {
+        // Debug builds run the same shapes/fees but a thinner budget list:
+        // the search cost at a given budget does not depend on optimization
+        // level, so this keeps `cargo test` fast without skipping any shape.
+        #[cfg(debug_assertions)]
+        let budgets: &[u64] = &[0, 100, 10_000, DEFAULT_OPTIMIZER_WORK];
+        #[cfg(not(debug_assertions))]
+        let budgets: &[u64] = &[0, 1, 100, 2000, 10_000, 100_000, DEFAULT_OPTIMIZER_WORK];
+
+        let mut report = Vec::new();
+        for &(shape_name, shape_fn) in SHAPES {
+            let parents = shape_fn(ADVERSARIAL_COUNT);
+            for &(fee_name, fee_fn) in FEE_PATTERNS {
+                let entries = fee_fn(ADVERSARIAL_COUNT);
+                let cluster = Cluster::new(entries, parents.clone()).unwrap();
+                let old = (0..ADVERSARIAL_COUNT).collect::<Vec<_>>();
+                assert!(
+                    cluster.valid_order(&old),
+                    "{shape_name}/{fee_name}: identity order must be topological for this shape"
+                );
+                let old_chunks = chunk_linearization(&cluster.entries, &old);
+                let mut work_at_default = 0;
+                let mut converged_at_default = false;
+                for &budget in budgets {
+                    let result = cluster.linearize_with_budget(Some(&old), budget);
+                    assert!(
+                        result.work_used <= budget,
+                        "{shape_name}/{fee_name} budget={budget}: spent {} > budget",
+                        result.work_used
+                    );
+                    assert!(
+                        cluster.valid_order(&result.order),
+                        "{shape_name}/{fee_name} budget={budget}: not a valid topological order"
+                    );
+                    let chunks = chunk_linearization(&cluster.entries, &result.order);
+                    for window in chunks.windows(2) {
+                        assert_ne!(
+                            window[0].feerate_cmp(window[1]),
+                            Ordering::Less,
+                            "{shape_name}/{fee_name} budget={budget}: chunk feerates increase"
+                        );
+                    }
+                    let comparison = compare_diagrams(&chunks, &old_chunks);
+                    assert!(
+                        matches!(
+                            comparison,
+                            DiagramComparison::Better | DiagramComparison::Equal
+                        ),
+                        "{shape_name}/{fee_name} budget={budget}: {comparison:?}"
+                    );
+                    if budget == DEFAULT_OPTIMIZER_WORK {
+                        work_at_default = result.work_used;
+                        converged_at_default = result.optimal;
+                    }
+                }
+                // Convergence at the production budget is recorded, not
+                // required: a shape that does not converge is still checked
+                // above to never worsen the baseline diagram at every budget.
+                report.push((shape_name, fee_name, work_at_default, converged_at_default));
+            }
+        }
+        for (shape, fee, work, converged) in &report {
+            eprintln!(
+                "adversarial shape={shape} fee={fee} work_used@DEFAULT={work} converged={converged}"
+            );
+        }
+    }
 }

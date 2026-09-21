@@ -192,4 +192,66 @@ fuzz_target!(|input: &[u8]| {
         DiagramComparison::Incomparable => DiagramComparison::Incomparable,
     };
     assert_eq!(backward, mirrored, "comparison is antisymmetric");
+
+    // Budgeted search: a fuzz-derived work allowance and optional previous
+    // order must never exceed the allowance, must still produce a valid
+    // topological order with non-increasing chunk feerates, and — whenever
+    // the previous order was valid and actually reused — must never worsen
+    // that previous diagram.
+    let (budget_bytes, rest) = data.split_at(2.min(data.len()));
+    data = rest;
+    let mut budget_raw = [0_u8; 2];
+    budget_raw[..budget_bytes.len()].copy_from_slice(budget_bytes);
+    // Scaled to span from zero through just past DEFAULT_OPTIMIZER_WORK.
+    let budget = u64::from(u16::from_le_bytes(budget_raw)) * 16;
+    let previous_mode = data.first().copied().unwrap_or(0);
+    let previous_candidate: Option<Vec<usize>> = match previous_mode % 3 {
+        0 => None,
+        1 => Some(order.clone()),
+        _ => Some(order.iter().rev().copied().collect()),
+    };
+    let budgeted = cluster.linearize_with_budget(previous_candidate.as_deref(), budget);
+    assert!(
+        budgeted.work_used <= budget,
+        "budgeted search exceeded its allowance"
+    );
+    assert_eq!(budgeted.order.len(), cluster.len());
+    let mut budget_position = vec![usize::MAX; cluster.len()];
+    for (index, &tx) in budgeted.order.iter().enumerate() {
+        assert_eq!(
+            budget_position[tx],
+            usize::MAX,
+            "no duplicates (budgeted)"
+        );
+        budget_position[tx] = index;
+    }
+    for (child, direct) in parents.iter().enumerate() {
+        for &parent in direct {
+            assert!(
+                budget_position[parent] < budget_position[child],
+                "parents precede children (budgeted)"
+            );
+        }
+    }
+    let budgeted_chunks = chunk_linearization(cluster.fractions(), &budgeted.order);
+    for window in budgeted_chunks.windows(2) {
+        assert_ne!(
+            window[0].feerate_cmp(window[1]),
+            Ordering::Less,
+            "budgeted chunk feerates increase"
+        );
+    }
+    if let Some(candidate) = &previous_candidate {
+        if budgeted.previous_reused {
+            let candidate_chunks = chunk_linearization(cluster.fractions(), candidate);
+            let comparison = compare_diagrams(&budgeted_chunks, &candidate_chunks);
+            assert!(
+                matches!(
+                    comparison,
+                    DiagramComparison::Better | DiagramComparison::Equal
+                ),
+                "budgeted search worsened a reused previous diagram"
+            );
+        }
+    }
 });
