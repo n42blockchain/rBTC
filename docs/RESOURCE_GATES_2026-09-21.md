@@ -117,3 +117,51 @@ Merged tree `beb6739`: `cargo clippy --lib --tests -- -D warnings` clean;
 test targets compile. The Mac all-feature suite and readiness script tests are
 pending (the readiness script tests fail on Windows before and after this round
 because of CRLF checkout and symlink privilege, not because of these changes).
+
+## Second pass, same day
+
+**Optimizer single-order short-circuit** (`1894f8e`). If the baseline order is
+the only topological order, `linearize_with_budget` returns it as optimal after
+an `O(n + edges)` check charged to the budget. A pair of consecutive entries
+without a direct edge could be swapped, so an order is unique exactly when
+every consecutive pair is a direct edge. When the budget cannot cover the
+check, the existing search runs unchanged. The adversarial sweep now converges
+for all 15 cases. Complete DAGs use 2,080 work, down from up to 1,000,000 with
+no convergence in the sawtooth case. Long chains use 127, down from up to
+695,047. The other shapes are unchanged within the check cost.
+`unique_order_clusters_short_circuit_the_search` and
+`independent_roots_are_not_short_circuited` cover the rule.
+
+**Up-front candidate work gate** (`43908ca`). `admit_package_at` estimates the
+candidate's conservative total work from the formulas its stages use. The
+estimate covers payload traversal and bytes, metadata, prevout preparation and
+precharge, and graph. It is checked before any stage runs:
+`CandidateUnfittable` if it exceeds `work_burst`, otherwise a retryable
+`ResourceDeferred` without touching any counter if the current allowance is
+short. The existing per-stage charges are unchanged, so nothing is charged
+twice. A deferred candidate no longer spends non-refundable allowance on a
+partial attempt, and because the estimate never exceeds the burst, a retry
+after refill can proceed. This replaces true mid-candidate resumption.
+Limitation: a new transaction's sigop component of the script charge is
+unknown before prevout resolution and is omitted from the estimate. A
+high-sigop candidate can still defer after partial charges, as before.
+
+**Peer-facing snapshots.** Charging peer `mempool`/`getdata` and relay
+snapshots to the shared admission ledger was evaluated and rejected. At about
+300 MB of retained pool, each whole-pool charge would let a few getdata
+messages per second starve all admission. Instead, single-transaction getdata
+now uses the txid index or a scan of stored wtxids
+(`TransactionAdmissionPool::transaction`/`transaction_by_wtxid`). This removes
+a pre-existing whole-pool clone and rehash per request. `mempool` responses,
+relay polls and operator RPC still clone the pool. They are bounded by
+`mempool_max_bytes` and are not charged to the admission ledger.
+
+Remaining admission items: an explicit separate budget for whole-pool
+snapshot serving if it is required, the sigop estimate gap, and serialized
+admission behind one pool mutex, which is kept as a declared boundary.
+
+Verification of the second pass on Windows: `cargo fmt --check` (both
+crates), `cargo clippy --all-targets --all-features` and the fuzz crate
+Clippy are clean. `cargo test --lib` passed 882 with 9 ignored, and all
+integration targets compile. This pass also applied rustfmt to the first-pass
+code (`05a32bd`); CI would otherwise have rejected it.
