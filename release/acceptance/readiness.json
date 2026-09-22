@@ -1,21 +1,16 @@
 {
-  "format": 1,
+  "format": 2,
   "tested_commit": "3cf44ae68003ceb78e9f0c77042667b475091716",
   "source_sha256": "41531cb896eba13a13fabde1170e519ab3b90c4b0940232c45125120bfdc0431",
   "gates": {
-    "optimizer-budget": {
-      "status": "open",
-      "reason": "Core differential samples pass; adversarial 64-entry shape/budget sweeps converge with a single-order short-circuit. A budgeted-search fuzz campaign and low-budget differential remain open.",
-      "evidence": []
-    },
     "admission-resources": {
       "status": "open",
-      "reason": "Prevout precharge, a sigop-bounded up-front work gate, unfittable refusal and id-only peer mempool serving exist; whole-pool snapshot budgeting is not accepted and serialized admission is a declared boundary.",
+      "reason": "Admission correctness, bounded resource use, recovery/fault behavior and the finite optimizer differential matrix require one canonical current-source report; optimizer work is part of this gate, not an independent open-ended release condition.",
       "evidence": []
     },
     "header-resources": {
       "status": "open",
-      "reason": "Ingress eviction, idle retention, atomic durable fork cursors, emergency staging/replay entry ceilings, and a bounded hostile-header feeder exist; calibrated byte/work budgets, disk-backed oversized-fork recovery, and sustained whole-node acceptance remain open.",
+      "reason": "The canonical finite report must combine semantic/network/recovery tests with the one-hour, one-million-sibling retained-header probe and its fixed RSS, disk and plateau allowances.",
       "evidence": []
     },
     "storage-replay": {

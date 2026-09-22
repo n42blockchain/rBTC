@@ -71,7 +71,8 @@ provenance, not a substitute for native OS signatures.
 ## Implemented workflow
 
 `.github/workflows/release.yml` first requires acceptance reports for frozen
-source and successful main CI on the exact release commit. It then fails
+release-relevant source and successful exact-SHA push CI on `main` or a
+`release/*` branch. It then fails
 closed before building unless all
 native signing credentials are present in the protected `release-signing`
 environment. A semantic `v*` tag must point at the workflow commit. Manual runs
@@ -105,9 +106,9 @@ exactly `v` plus the package version. The preflight independently reads the
 version through locked Cargo metadata, and every native job runs the complete
 all-feature test suite before executing the built binary's `--version` and
 `--help` and side-effect-free `--check-config` paths.
-`scripts/test-release-manifest.sh` and `scripts/test-release-readiness.py` run
-in ordinary CI, including malformed-field, schema-drift and stale-evidence
-regressions.
+`scripts/test-release-manifest.sh`, `scripts/test-release-readiness.py`, and the
+admission/header resource-checker rejection suites run in ordinary CI,
+including malformed-field, schema-drift and stale-evidence regressions.
 
 ## Protected environment inputs
 

@@ -41,9 +41,11 @@ jobs:
           import json, os
           runs = json.load(open('ci-runs.json'))['workflow_runs']
           eligible = [run for run in runs if run['head_sha'] == os.environ['GITHUB_SHA']
-                      and run['event'] == 'push' and run['head_branch'] == 'main']
+                      and run['event'] == 'push'
+                      and (run['head_branch'] == 'main'
+                           or run['head_branch'].startswith('release/'))]
           if not eligible or max(eligible, key=lambda run: run['id'])['conclusion'] != 'success':
-              raise SystemExit('the latest main CI run for this exact commit must succeed before release')
+              raise SystemExit('successful main or release/* push CI for this exact commit is required')
           PY
 
   signing-preflight:

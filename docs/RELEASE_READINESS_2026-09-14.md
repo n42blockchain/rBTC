@@ -1,14 +1,19 @@
 # Release readiness, 2026-09-14
 
+Policy update 2026-09-22: [RELEASE_POLICY.md](RELEASE_POLICY.md) defines the
+current finite gate set. It merges optimizer acceptance into admission,
+excludes experimental MDBX selection from the default-redb release, permits
+documentation/evidence-only commits after source freeze, and accepts exact-SHA
+push CI from `main` or `release/*`. Dated measurements below remain historical.
+
 rBTC remains pre-release. Ordinary CI does not close the production resource
 and public-network acceptance gates. This current inventory supersedes old
 release-facing summaries without replacing dated measurements or failed evidence.
 
 | Gate | Current evidence and remaining work |
 | --- | --- |
-| Optimizer budget | 4,096 Core comparisons passed, including 2,048 permuted DAGs. Broader adversarial and exhausted-budget acceptance remains open; budget units are not claimed identical to Core. |
-| Admission resources | Shared work/candidate leases, atomic deferral and a pinned durable pool snapshot exist. Prevout preallocation, escaping allocations, concurrency and resumable scheduling remain open. |
-| Competing headers | [Single-slot disk candidates and bounded atomic promotion](../release/acceptance/header-node-candidates-20260916.md) now run in primary header sync; primary/standby/local validation share a work pool. Huge-winner activation, shared byte/disk budgets, total startup memory and long-duration whole-node acceptance remain open. |
+| Admission resources and optimizer | Shared work/candidate leases, atomic deferral and a pinned durable pool snapshot exist. The finite Core optimizer differential is now a required component of this gate rather than a separate open-ended gate. Run the canonical resource acceptance command in `RELEASE_POLICY.md`. |
+| Competing headers | [Single-slot disk candidates and bounded atomic promotion](../release/acceptance/header-node-candidates-20260916.md) now run in primary header sync; primary/standby/local validation share a work pool. The finite canonical header resource report remains open; long-duration whole-node behavior is covered once by the public-network soak. |
 | Selected historical replay | At `b078798`, both engines executed 28,350 blocks (935001–963350), reopened and produced canonical digest `aadd289f6edf154e55aec63c9b4c22cd46e2d7836dc55382d0036523247f2819`. This selected window used file-page-cold inputs on a shared host; it is not genesis or isolated device performance. Preserve this evidence and freeze the final source before final acceptance. |
 | Public soak | No accepted 604,800-second Bitcoin/Testnet4 report exists for final source. Freeze production changes and catch up both networks before starting; exercise restarts/faults after day one. Historical calendar age is not acceptance. |
 | Experimental MDBX replacement | Full no-maintenance churn passed at a 1.1227 RSS ratio; reduced maintenance still failed at 3.387 after allocation improvements. Bound transitions, undo, folded indexes and dirty pages together. MDBX remains excluded from supported default-feature release binaries; its separate replacement gate is not accepted. |
@@ -23,12 +28,13 @@ reference a nonempty committed report with its SHA-256. Current entries remain
 open. Missing, edited, untracked, oversized, path-escaping or symlinked reports
 fail closed. Duplicate JSON keys are rejected.
 
-The manifest binds a full frozen `tested_commit` and a SHA-256 over Git tree
-records. Every tracked file and mode is included except `release/acceptance/`.
-Reports may therefore be committed after testing without a circular commit
-reference. Production, test, dependency, workflow, script or documentation
-changes invalidate the identity. Keep executable code outside the evidence
-directory. The tested commit must be an ancestor of the release commit.
+The format-2 manifest binds a frozen `tested_commit` and a recursive SHA-256
+over release-relevant Git tree records. Production, test, dependency, workflow,
+build and acceptance-tool changes invalidate the identity. `docs/`, `README.md`
+and `release/acceptance/` are excluded, so documentation and reviewed reports
+may follow testing without a circular commit reference. Keep executable code
+outside excluded paths. The tested commit must be an ancestor of the release
+commit.
 
 For public soak, preserve the unedited final report produced by
 `scripts/public-network-soak-report.sh SOAK_DIR` with its default seven-day
@@ -51,9 +57,10 @@ python3 scripts/verify-release-readiness.py
 ```
 
 The release workflow checks evidence before requesting signing secrets. It also
-requires the latest main CI run for the exact release commit to have succeeded.
-Complete main CI before tagging, or rerun release after it passes. Manual signed
-matrix rehearsals enforce the same acceptance checks and never publish.
+requires successful ordinary push CI for the exact release commit on `main` or
+a `release/*` branch. Complete exact-source CI before tagging, or rerun release
+after it passes. Manual signed matrix rehearsals enforce the same acceptance
+checks and never publish.
 
 ## Packaging corrections and verification
 

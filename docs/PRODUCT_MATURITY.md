@@ -6,6 +6,8 @@ This is the release-facing maturity view. Detailed implementation history stays
 in [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).
 Current blockers and evidence preflight are in
 [RELEASE_READINESS_2026-09-14.md](RELEASE_READINESS_2026-09-14.md).
+The authoritative bounded gate definitions are in
+[RELEASE_POLICY.md](RELEASE_POLICY.md).
 
 | Area | Repository status | Release evidence |
 | --- | --- | --- |
@@ -35,9 +37,10 @@ Current blockers and evidence preflight are in
 5. No release claim may convert an incomplete soak, unavailable credential,
    accepted platform limitation, or deployment-specific P2 feature into a
    repository-complete checkbox.
-6. Preflight requires reviewed reports bound to frozen source and successful
-   main CI for the exact release commit. Only evidence-only commits may follow
-   the tested source without invalidating its identity.
+6. Preflight requires reviewed reports bound to the release-relevant frozen
+   source and successful push CI for the exact release commit on `main` or a
+   `release/*` branch. Documentation and evidence-only commits may follow the
+   tested source without invalidating its identity.
 
 ## Deliberate product boundaries
 

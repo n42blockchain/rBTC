@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check sustained retained-header kernel evidence; never close the node gate."""
+"""Check the sustained retained-header component of the finite release gate."""
 import argparse
 import hashlib
 import json
@@ -89,10 +89,10 @@ def main():
     raw = args.samples.read_bytes()
     result = check([json.loads(line) for line in raw.splitlines()], seconds=args.minimum_seconds,
                    max_rss=args.max_rss_mib * 1024**2, max_disk=args.max_disk_mib * 1024**2)
-    result.update(scope="header-kernel-retention-only", headers_production_gate_closed=False,
+    result.update(scope="canonical-header-retention-component", component_acceptance_passed=result["passed"],
                   samples_sha256=hashlib.sha256(raw).hexdigest(), minimum_seconds=args.minimum_seconds,
                   max_rss_bytes=args.max_rss_mib * 1024**2, max_disk_bytes=args.max_disk_mib * 1024**2,
-                  limitation="phase samples are not a continuous process high-water mark")
+                  limitation="combine with the required semantic, network-path and fault tests")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["passed"] else 1
 

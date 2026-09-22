@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Require reviewed acceptance evidence for the exact release source tree.
 
-Evidence-only commits are allowed after freezing/testing the source. This checks
-identity and completeness of reviewed reports; it does not replace their tests
-or independently attest that an operator's measurements occurred.
+Evidence and documentation-only commits are allowed after freezing/testing the
+release-relevant source. This checks identity and completeness of reviewed
+reports; it does not replace their tests or independently attest that an
+operator's measurements occurred.
 """
 
 import argparse
@@ -17,9 +18,10 @@ import sys
 
 
 EVIDENCE_DIR = "release/acceptance"
-GATES = ("optimizer-budget", "admission-resources", "header-resources",
-         "storage-replay", "public-soak")
+GATES = ("admission-resources", "header-resources", "storage-replay", "public-soak")
 MAX_REPORT_BYTES = 2 * 1024 * 1024
+NON_RUNTIME_PREFIXES = (EVIDENCE_DIR + "/", "docs/")
+NON_RUNTIME_FILES = {"README.md"}
 
 
 def git(root, *args):
@@ -27,11 +29,18 @@ def git(root, *args):
 
 
 def source_digest(root, revision):
-    records = git(root, "ls-tree", "-rz", "--full-tree", revision).split(b"\0")
-    # Exclude only evidence. Workflows, scripts, docs, dependency locks and all
-    # production/test sources remain bound, including file modes and symlinks.
-    source = [row for row in records if row and
-              not row.split(b"\t", 1)[1].startswith((EVIDENCE_DIR + "/").encode())]
+    records = git(root, "ls-tree", "-rz", "-r", "--full-tree", revision).split(b"\0")
+    # Bind every release-relevant file recursively, including file modes and
+    # symlinks. Human documentation and reviewed evidence cannot change the
+    # executable, dependency graph, build, workflow or acceptance tooling, so
+    # those files may follow a frozen candidate without invalidating its tests.
+    def relevant(row):
+        if not row:
+            return False
+        path = row.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")
+        return path not in NON_RUNTIME_FILES and not path.startswith(NON_RUNTIME_PREFIXES)
+
+    source = [row for row in records if relevant(row)]
     return hashlib.sha256(b"\0".join(source) + b"\0").hexdigest()
 
 
@@ -101,6 +110,34 @@ def verify_soak(report, tested_commit):
             raise ValueError(f"soak is missing {name}")
 
 
+def verify_resource_report(report, gate, tested_commit, source_sha256):
+    def field(name):
+        matches = re.findall(r"^- " + re.escape(name) + r": `([^`]+)`$", report, re.MULTILINE)
+        if len(matches) != 1:
+            raise ValueError(f"{gate} report has a missing or ambiguous {name}")
+        return matches[0]
+
+    if field("Gate") != gate:
+        raise ValueError(f"{gate} report names a different gate")
+    if field("Commit") != tested_commit:
+        raise ValueError(f"{gate} report tested a different commit")
+    if field("Source SHA-256") != source_sha256:
+        raise ValueError(f"{gate} report tested a different source digest")
+    if field("Acceptance status") != "PASS":
+        raise ValueError(f"{gate} acceptance is not PASS")
+    required = {
+        "admission-resources": (
+            "Functional test status", "Optimizer differential status",
+            "Resource probe status", "Recovery/fault status"),
+        "header-resources": (
+            "Functional test status", "Semantic comparison status",
+            "Sustained probe status", "Restart/fault status"),
+    }[gate]
+    for name in required:
+        if field(name) != "PASS":
+            raise ValueError(f"{gate} {name} is not PASS")
+
+
 def verify(root):
     path = root / EVIDENCE_DIR / "readiness.json"
     if path.is_symlink() or path.stat().st_size > MAX_REPORT_BYTES:
@@ -109,7 +146,7 @@ def verify(root):
     if git(root, "show", "HEAD:" + EVIDENCE_DIR + "/readiness.json") != payload:
         raise ValueError("readiness manifest differs from HEAD")
     data = json.loads(payload, object_pairs_hook=unique_object)
-    if set(data) != {"format", "tested_commit", "source_sha256", "gates"} or data["format"] != 1:
+    if set(data) != {"format", "tested_commit", "source_sha256", "gates"} or data["format"] != 2:
         raise ValueError("unsupported readiness manifest")
     gates = data["gates"]
     if not isinstance(gates, dict) or set(gates) != set(GATES):
@@ -132,14 +169,24 @@ def verify(root):
     expected = source_digest(root, "HEAD")
     if source_digest(root, commit) != expected or data["source_sha256"] != expected:
         raise ValueError("acceptance source differs from the release source; repeat affected acceptance")
-    # This also catches local edits when an operator runs the preflight by hand.
-    git(root, "diff", "--exit-code", "HEAD", "--", ".", ":(exclude)" + EVIDENCE_DIR + "/**")
+    # This also catches local release-relevant edits and untracked build inputs
+    # when an operator runs the preflight by hand. Documentation and evidence
+    # are intentionally excluded.
+    status = git(root, "status", "--porcelain=v1", "--untracked-files=all", "--", ".",
+                 ":(exclude)" + EVIDENCE_DIR + "/**", ":(exclude)docs/**",
+                 ":(exclude)README.md")
+    if status:
+        raise ValueError("release-relevant working tree differs from HEAD")
     for name in GATES:
         reports = [read_report(root, record) for record in gates[name]["evidence"]]
         if name == "public-soak":
             if len(reports) != 1:
                 raise ValueError("public-soak requires one canonical final report")
             verify_soak(reports[0], commit)
+        elif name in ("admission-resources", "header-resources"):
+            if len(reports) != 1:
+                raise ValueError(f"{name} requires one canonical final report")
+            verify_resource_report(reports[0], name, commit, expected)
     return commit
 
 

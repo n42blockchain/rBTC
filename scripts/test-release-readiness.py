@@ -46,10 +46,30 @@ class ReleaseReadinessTests(unittest.TestCase):
             "- Fault scenarios completed: `1`\n- Acceptance status: `PASS`\n")
         other = self.directory / "resource.md"
         other.write_text("Synthetic reviewed resource fixture, never release evidence.\n")
-        self.data = {"format": 1, "tested_commit": self.tested,
-                     "source_sha256": readiness.source_digest(self.root, "HEAD"),
+        self.resource_reports = {}
+        source_sha256 = readiness.source_digest(self.root, "HEAD")
+        for gate, fields in {
+            "admission-resources": (
+                "Functional test status", "Optimizer differential status",
+                "Resource probe status", "Recovery/fault status"),
+            "header-resources": (
+                "Functional test status", "Semantic comparison status",
+                "Sustained probe status", "Restart/fault status"),
+        }.items():
+            path = self.directory / (gate + ".md")
+            path.write_text(
+                "# Synthetic resource fixture, never release evidence\n"
+                f"- Gate: `{gate}`\n- Commit: `{self.tested}`\n" +
+                f"- Source SHA-256: `{source_sha256}`\n" +
+                "".join(f"- {field}: `PASS`\n" for field in fields) +
+                "- Acceptance status: `PASS`\n")
+            self.resource_reports[gate] = path
+        self.data = {"format": 2, "tested_commit": self.tested,
+                     "source_sha256": source_sha256,
                      "gates": {name: {"status": "accepted", "reason": "Synthetic test only",
-                                      "evidence": [self.record(self.report if name == "public-soak" else other)]}
+                                      "evidence": [self.record(
+                                          self.report if name == "public-soak" else
+                                          self.resource_reports.get(name, other))]}
                                for name in readiness.GATES}}
         self.save()
 
@@ -85,9 +105,26 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.commit("test: change fixture workflow")
         self.reject("source differs")
 
+    def test_documentation_only_commit_preserves_frozen_identity(self):
+        documentation = self.root / "docs" / "policy.md"
+        documentation.parent.mkdir()
+        documentation.write_text("Synthetic policy clarification.\n")
+        self.commit("docs: clarify synthetic policy")
+        self.assertEqual(readiness.verify(self.root), self.tested)
+
     def test_dirty_source_is_rejected(self):
         (self.root / "source.rs").write_text("// uncommitted change\n")
-        self.reject("diff")
+        self.reject("differs from HEAD")
+
+    def test_untracked_source_is_rejected(self):
+        (self.root / "untracked.rs").write_text("// untracked build input\n")
+        self.reject("differs from HEAD")
+
+    def test_dirty_documentation_does_not_change_the_frozen_identity(self):
+        documentation = self.root / "docs" / "operator-note.md"
+        documentation.parent.mkdir()
+        documentation.write_text("Uncommitted synthetic clarification.\n")
+        self.assertEqual(readiness.verify(self.root), self.tested)
 
     def test_dirty_evidence_is_rejected(self):
         self.report.write_text(self.report.read_text() + "uncommitted\n")
@@ -107,7 +144,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.reject("every required production gate")
 
     def test_duplicate_json_key(self):
-        self.manifest.write_text(self.manifest.read_text().replace('"format": 1', '"format": 1, "format": 1'))
+        self.manifest.write_text(self.manifest.read_text().replace('"format": 2', '"format": 2, "format": 2'))
         self.commit("test: duplicate fixture field")
         self.reject("duplicate JSON key")
 
@@ -159,6 +196,22 @@ class ReleaseReadinessTests(unittest.TestCase):
                 self.data["gates"]["public-soak"]["evidence"] = [self.record(self.report)]
                 self.save()
                 self.reject("soak")
+
+    def test_invalid_resource_report_cannot_be_accepted_by_a_checkbox(self):
+        path = self.resource_reports["admission-resources"]
+        original = path.read_text()
+        for content in (
+            original.replace("Resource probe status: `PASS`", "Resource probe status: `FAIL`"),
+            original.replace(f"Commit: `{self.tested}`", f"Commit: `{'0' * 40}`"),
+            original.replace(f"Source SHA-256: `{self.data['source_sha256']}`",
+                             f"Source SHA-256: `{'0' * 64}`"),
+            original.replace("Gate: `admission-resources`", "Gate: `header-resources`"),
+            original.replace("- Recovery/fault status: `PASS`\n", ""),
+        ):
+            path.write_text(content)
+            self.data["gates"]["admission-resources"]["evidence"] = [self.record(path)]
+            self.save()
+            self.reject("admission-resources")
 
 
 if __name__ == "__main__":
