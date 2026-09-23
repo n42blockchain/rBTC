@@ -210,3 +210,27 @@ planned for this release.
 Verification of the third pass on Windows (merge `e74f24e`): `cargo fmt --check`
 (both crates) and `cargo clippy --all-targets` are clean. `cargo test --lib`
 passed 885 with 10 ignored, and all integration targets compile.
+
+## Correction after the disk-candidate implementation
+
+The earlier declared boundary above that a competing chain beyond the retained
+side-header cap "cannot overtake through ordinary sync" is superseded by the
+disk-candidate implementation. Current header sync spills a competing branch
+to a bounded, checksummed journal at the configured retention threshold,
+resumes and contextually revalidates it after reconnect/restart, and streams a
+winning candidate into atomic promotion. The 16,384-header in-memory cap is
+therefore not itself a maximum reorganization depth.
+
+This does not yet establish fair scheduling among multiple simultaneous
+competing branches: the node owns one candidate journal. A different branch
+received while that journal is occupied uses its retained ancestry for that
+peer conversation, but the saved candidate remains the only disk-backed
+candidate. Treat any claim that this permanently prevents a higher-work branch
+from winning as unproven until a peer-sequence regression reproduces it; if
+reproduced, classify it as a best-work-chain progress defect, not as an RSS
+threshold failure. Existing one-candidate restart/promotion tests and the
+current resource probe do not answer that fairness question.
+
+For current release decisions, use `docs/RELEASE_POLICY.md` as the policy
+classification. This dated report is implementation history; its workload
+counts, ceilings and remaining-work lists are not independent release gates.

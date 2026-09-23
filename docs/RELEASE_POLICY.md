@@ -17,6 +17,38 @@ use a stable release tag, and does not waive any production gate. Experimental
 MDBX replacement, full RPC parity, hot-key wallet support and performance-only
 optimizations are outside the default-redb production claim.
 
+## What is a release requirement
+
+Do not describe repository release policy as a Bitcoin protocol rule. BIPs
+distinguish consensus specifications from other proposal types and state that
+an individual BIP does not define Bitcoin or automatically represent community
+consensus. The client must follow the consensus rules actually active for each
+supported network; it does not need to implement every BIP, Bitcoin Core RPC,
+or Bitcoin Core's local mempool policy to be a Bitcoin validating node. See
+[BIP 3](https://github.com/bitcoin/bips/blob/master/bip-0003.md).
+
+| Class | What belongs here | Release treatment |
+| --- | --- | --- |
+| Protocol and data-safety invariants | Correct validation under the active network rules; cumulative-work chain selection and reorganization; no publication of invalid state; durable, atomic state transitions and restart recovery; bounded handling of untrusted network and operator input. | Mandatory for every release claiming a validating node. A defect here blocks release regardless of benchmark or soak status. |
+| Project release policy | Supported operating systems and artifact trust; exact-source CI; resource ceilings and adversarial test envelopes; Core 31 differential checks for local transaction ordering; seven-day public soak; signed artifacts, provenance and manifest. | Mandatory for the production claim while this policy is in force. These are project choices, not Bitcoin consensus rules. Each must have a stated risk, owner, finite evidence procedure and explicit disposition. A policy change requires a recorded decision; it must not be disguised as a protocol exception. |
+| Deferred or excluded features | Full Bitcoin Core RPC parity, hot-key wallet, mining, experimental MDBX replacement, and deployment-specific packaging. | Do not gate this product claim unless the release begins claiming the feature. Document limitations honestly. |
+
+The fixed RSS, disk, time and load values below are provisional project
+acceptance envelopes. They are not universal limits imposed by Bitcoin. Keep
+them only where the test models a named threat or supported deployment and the
+ceiling leaves adequate operating headroom. If the envelope fails, first
+determine whether the run exposed unbounded behavior, an unsuitable test
+workload, or an unjustified number; do not automatically add another
+optimization task. Passing a synthetic probe is not proof of whole-node safety
+or production readiness.
+
+In particular, the one-hour million-sibling workload is a bounded hostile-input
+regression test, while 604,800 seconds is the current first-production soak
+policy. Neither duration is protocol-mandated. Keep the soak as a production
+gate until a release owner explicitly revises that policy based on equivalent
+or stronger operational evidence; elapsed time by itself is never evidence of
+correctness.
+
 ## Required gates
 
 `release/acceptance/readiness.json` format 2 has exactly four gates:
@@ -56,6 +88,13 @@ source and every required component is `PASS`. Passing a unit test or probe in
 isolation cannot close a gate. A new release requirement needs an owner,
 rationale, bounded procedure, pass/fail rule and disposition of prior evidence;
 open-ended implementation inventories are backlog, not release gates.
+
+The listed counts, ceilings and durations make this round reproducible; they
+are project regression parameters, not maximum valid Bitcoin conditions or
+protocol conformance limits. An out-of-envelope result is evidence to diagnose,
+not an automatic mandate for more optimization work. Before changing a value,
+record which safety risk the workload represents and why the replacement gives
+equal or better coverage.
 
 These component gates deliberately do not make an unmeasured whole-process
 claim. End-to-end daemon RSS, disk growth, peer diversity, tip consistency and
