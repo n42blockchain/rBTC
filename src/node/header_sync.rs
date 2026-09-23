@@ -584,7 +584,12 @@ pub(super) async fn sync_headers_with_policy(
             let mut lease = work(BATCH_WORK).await;
             dag.append(&store, unseen, now()?, &mut lease.budget, true)?;
             if let Some(side_target) = policy.retained_side_headers {
-                dag.retain_ingress(&store, side_target, &[], &mut lease.budget)?;
+                let candidate_anchor = candidate
+                    .as_ref()
+                    .map(DiskHeaderCandidate::anchor)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                dag.retain_ingress(&store, side_target, &candidate_anchor, &mut lease.budget)?;
             }
         }
         recovery_tip = response_tip;
@@ -596,7 +601,12 @@ pub(super) async fn sync_headers_with_policy(
     store.clear_recovery_tip().map_err(local)?;
     if let Some(side_target) = policy.retained_side_headers {
         let mut lease = work(BATCH_WORK).await;
-        dag.retain_ingress(&store, side_target, &[], &mut lease.budget)?;
+        let candidate_anchor = candidate
+            .as_ref()
+            .map(DiskHeaderCandidate::anchor)
+            .into_iter()
+            .collect::<Vec<_>>();
+        dag.retain_ingress(&store, side_target, &candidate_anchor, &mut lease.budget)?;
     }
     rbtc_info!(
         "peer returned no more headers at {}:{} (pending_disk_candidate={})",

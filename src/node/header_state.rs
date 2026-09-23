@@ -4,7 +4,6 @@ use super::{
     RedbHeaderStore, header_sync,
 };
 use crate::{
-    header_candidate::DiskHeaderCandidate,
     header_index::{DiskHeaderIndex, DiskHeaderView, HeaderIndexError},
     headers::HeaderWorkBudget,
 };
@@ -196,12 +195,6 @@ impl NodeHeaderState {
         let mut protected = pins.to_vec();
         if let Some(cursor) = store.recovery_tip().map_err(local)? {
             protected.push(cursor);
-        }
-        if let Some(anchor) =
-            DiskHeaderCandidate::stored_anchor(header_sync::candidate_path(&self.path))
-                .map_err(local)?
-        {
-            protected.push(anchor);
         }
         let stage = self
             .index

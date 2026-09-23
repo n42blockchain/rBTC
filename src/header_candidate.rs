@@ -193,6 +193,11 @@ impl DiskHeaderCandidate {
     pub fn tip(&self) -> HeaderInfo {
         self.context.tip()
     }
+
+    /// Returns the validated anchor without reopening the exclusively locked journal.
+    pub fn anchor(&self) -> BlockHash {
+        self.anchor
+    }
     /// Number of candidate headers, excluding the anchor.
     pub const fn len(&self) -> u64 {
         self.count
