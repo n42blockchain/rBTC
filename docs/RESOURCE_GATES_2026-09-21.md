@@ -221,15 +221,31 @@ resumes and contextually revalidates it after reconnect/restart, and streams a
 winning candidate into atomic promotion. The 16,384-header in-memory cap is
 therefore not itself a maximum reorganization depth.
 
-This does not yet establish fair scheduling among multiple simultaneous
-competing branches: the node owns one candidate journal. A different branch
-received while that journal is occupied uses its retained ancestry for that
-peer conversation, but the saved candidate remains the only disk-backed
-candidate. Treat any claim that this permanently prevents a higher-work branch
-from winning as unproven until a peer-sequence regression reproduces it; if
-reproduced, classify it as a best-work-chain progress defect, not as an RSS
-threshold failure. Existing one-candidate restart/promotion tests and the
-current resource probe do not answer that fairness question.
+The single-journal scheduling limit did expose a separate, concrete progress
+bug. A loopback regression started with a losing 2,000-header candidate A on
+disk, then supplied a different 2,003-header fork B in two protocol responses.
+The old path appended B to the in-memory DAG while A occupied the journal. Side
+retention could evict B's recovery cursor; the following locator failed with
+`header recovery ancestry missing`.
+
+The fix protects the durable recovery cursor while a response is in flight. If
+a different fork reaches the spill threshold while the only journal contains a
+losing candidate, the journal is reassigned to the currently followed peer's
+fork. The displaced losing fork can be reacquired from the common ancestor.
+The candidate anchor is protected during retention, and after synchronization
+the recovery cursor is cleared before final retention so completed losing
+history returns to the configured cap. A first in-memory batch can temporarily
+exceed that target by at most one protocol response (2,000 headers); once a
+candidate is spilled, its journal has the existing 128 MiB file limit.
+
+The regression also disconnects after B's first response, rebuilds header state
+from storage, resumes B's replacement journal, promotes B when its cumulative
+work exceeds the active chain, and reopens the store to check the selected tip.
+A companion test covers cursor protection when no candidate was already on
+disk and verifies completed losing history returns to the configured cap.
+These are targeted Regtest semantics/recovery tests; they do not replace the
+canonical Linux resource acceptance or public-network soak. The exact-source
+acceptance run must include them before this header gate can be accepted.
 
 For current release decisions, use `docs/RELEASE_POLICY.md` as the policy
 classification. This dated report is implementation history; its workload

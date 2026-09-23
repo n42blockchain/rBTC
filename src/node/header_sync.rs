@@ -546,10 +546,15 @@ pub(super) async fn sync_headers_with_policy(
         let side = dag
             .retained_header_count()
             .saturating_sub(dag.active_tip().height as usize + 1);
-        if candidate.is_none()
-            && unseen[0].prev_blockhash != dag.active_tip().hash
-            && side >= policy.spill_side_headers
-        {
+        if unseen[0].prev_blockhash != dag.active_tip().hash && side >= policy.spill_side_headers {
+            // A different peer can reveal a competing branch while the
+            // single bounded journal holds a losing candidate. Reassign that
+            // journal to the branch this session is following; discarded
+            // losing headers remain reacquirable through the common locator.
+            if candidate.is_some() {
+                drop(candidate.take());
+                fs::remove_file(&pending_path).map_err(local)?;
+            }
             let mut lease = work(BATCH_WORK).await;
             let mut disk = DiskHeaderCandidate::open(
                 &pending_path,
@@ -588,11 +593,11 @@ pub(super) async fn sync_headers_with_policy(
             break;
         }
     }
+    store.clear_recovery_tip().map_err(local)?;
     if let Some(side_target) = policy.retained_side_headers {
         let mut lease = work(BATCH_WORK).await;
         dag.retain_ingress(&store, side_target, &[], &mut lease.budget)?;
     }
-    store.clear_recovery_tip().map_err(local)?;
     rbtc_info!(
         "peer returned no more headers at {}:{} (pending_disk_candidate={})",
         dag.active_tip().height,
