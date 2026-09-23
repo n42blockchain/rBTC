@@ -106,8 +106,11 @@ not change acceptance statuses or weaken thresholds.
    Engine-level read bounds, prepared copies, indexed
    paths, resumable resource scheduling and whole-node acceptance remain open.
 4. Optimizer: retain the previously accepted Core differential/budget result as
-   historical evidence; rerun affected final-source acceptance and bind exact
-   source identity after production changes stop.
+   historical evidence. The current checkout has a fresh **4096/4096** Core
+   differential plus exhausted-budget and exhaustive-small-graph checks
+   ([2026-09-22 evidence](optimizer-budget-20260922.md)); bind the final-source
+   acceptance again if optimizer code changes before the release candidate is
+   frozen.
 5. Historical replay: retain the accepted selected 935001–963350 comparison;
    after final source freeze, review effects and rerun/rebind required acceptance.
    This does not claim genesis-to-tip acceptance.
