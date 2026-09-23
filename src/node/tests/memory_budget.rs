@@ -247,7 +247,7 @@ fn replay_payload_admission_follows_prevalidation_staging_and_aliases() {
 }
 
 #[test]
-fn memory_retry_refuses_committed_pending_and_existing_stages() {
+fn memory_retry_adopts_new_attempt_stage_and_refuses_replacements() {
     use crate::execution_store::ExecutionTip;
     use crate::node_memory::ReservationKind;
     let directory = tempfile::tempdir().unwrap();
@@ -257,8 +257,17 @@ fn memory_retry_refuses_committed_pending_and_existing_stages() {
         hash: bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash(),
     };
     let memory = PeerFailureKind::LocalBudget(ReservationKind::Memory);
-    let next = |kind, size, after, scripts| {
-        next_memory_retry(kind, size, before, after, &ledger, scripts, None)
+    let mut expected_stage = None;
+    let mut next = |kind, size, after, scripts| {
+        next_memory_retry(
+            kind,
+            size,
+            before,
+            after,
+            &ledger,
+            scripts,
+            &mut expected_stage,
+        )
     };
     let mut size = 9;
     let mut sizes = Vec::new();
@@ -302,9 +311,11 @@ fn memory_retry_refuses_committed_pending_and_existing_stages() {
         ),
         None
     );
-    ledger.stage(1, &[vec![7], vec![8]]).unwrap();
+    ledger
+        .stage(1, &[vec![7], vec![8], vec![9], vec![10]])
+        .unwrap();
     let identity = ledger.staged_manifest().unwrap().unwrap();
-    assert_eq!(next(memory, 9, Some(before), false), None);
+    assert_eq!(next(memory, 9, Some(before), false), Some(2));
     assert_eq!(ledger.staged_manifest().unwrap().unwrap(), identity);
     assert!(ledger.retained_tip().unwrap().is_none());
     let path = directory.path().join("ledger-staged.rblk");
@@ -330,8 +341,17 @@ fn staged_memory_retry_requires_the_original_identity_and_uncommitted_tip() {
         hash: bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash(),
     };
     let memory = PeerFailureKind::LocalBudget(ReservationKind::Memory);
-    let next = |kind, size, after, scripts| {
-        next_memory_retry(kind, size, before, after, &ledger, scripts, Some(&identity))
+    let mut expected_stage = Some(identity.clone());
+    let mut next = |kind, size, after, scripts| {
+        next_memory_retry(
+            kind,
+            size,
+            before,
+            after,
+            &ledger,
+            scripts,
+            &mut expected_stage,
+        )
     };
     assert_eq!(next(memory, 100, Some(before), false), Some(2));
     assert_eq!(next(memory, 2, Some(before), false), Some(1));
@@ -609,6 +629,25 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
         let memory = crate::node_memory::MemoryBudget::new(64 * 1024 * 1024);
         memory.bind(std::slice::from_ref(&path)).unwrap();
         if case == "calibrate" {
+            // A fresh attempt can create its immutable stage before execution
+            // reaches a memory denial. Adopt that exact stage as the retry
+            // identity while the durable execution tip remains unchanged.
+            let before = chainstate.execution_tip().unwrap();
+            let mut expected_stage = None;
+            assert_eq!(
+                next_memory_retry(
+                    PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory),
+                    16,
+                    before,
+                    Some(before),
+                    &ledger,
+                    false,
+                    &mut expected_stage,
+                ),
+                Some(8)
+            );
+            assert_eq!(expected_stage, Some(identity.clone()));
+
             // Wrapper and attempt each hold a returned admitted identity.
             let outer = ledger.staged_manifest().unwrap().unwrap();
             let inner = ledger.staged_manifest().unwrap().unwrap();
@@ -635,6 +674,7 @@ async fn staged_memory_retry_calibrates_publication_and_stops_after_commit() {
                 "publication needs more than read and staging admission"
             );
             assert_eq!(chainstate.execution_tip().unwrap().height, 1);
+            drop(expected_stage);
             assert_eq!(memory.snapshot().used, 0);
             continue;
         }

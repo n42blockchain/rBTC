@@ -43,13 +43,23 @@ pub(crate) enum ReservationKind {
     ExecutionSpool,
 }
 #[derive(Debug)]
-struct ReservationDenied(ReservationKind);
+struct ReservationDenied {
+    kind: ReservationKind,
+    requested: u64,
+    used: u64,
+    limit: u64,
+}
 impl std::fmt::Display for ReservationDenied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self.0 {
+        let resource = match self.kind {
             ReservationKind::Memory => "node memory reservation allowance exhausted",
             ReservationKind::ExecutionSpool => "execution spool disk allowance exhausted",
-        })
+        };
+        write!(
+            f,
+            "{resource}: requested={} bytes used={} bytes limit={} bytes",
+            self.requested, self.used, self.limit
+        )
     }
 }
 impl std::error::Error for ReservationDenied {}
@@ -57,7 +67,7 @@ pub(crate) fn reservation_kind(error: &io::Error) -> Option<ReservationKind> {
     error
         .get_ref()?
         .downcast_ref::<ReservationDenied>()
-        .map(|error| error.0)
+        .map(|error| error.kind)
 }
 
 /// One node's memory ledger. Clones share the same allowance.
@@ -86,8 +96,25 @@ impl MemoryBudget {
     }
     /// Reserves before allocation; the returned lease follows its actual owner.
     pub fn reserve(&self, bytes: u64) -> io::Result<MemoryLease> {
-        self.try_reserve(bytes)
-            .ok_or_else(|| io::Error::other(ReservationDenied(ReservationKind::Memory)))
+        let mut usage = self
+            .0
+            .usage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if bytes > self.0.limit.saturating_sub(usage.used) {
+            return Err(io::Error::other(ReservationDenied {
+                kind: ReservationKind::Memory,
+                requested: bytes,
+                used: usage.used,
+                limit: self.0.limit,
+            }));
+        }
+        usage.used += bytes;
+        usage.peak = usage.peak.max(usage.used);
+        Ok(MemoryLease {
+            budget: self.clone(),
+            bytes,
+        })
     }
 
     // Native allocator callbacks must not allocate an error merely to reject
@@ -117,9 +144,12 @@ impl MemoryBudget {
         // Shared by active/background pipelines. This is an ephemeral logical
         // byte limit, not a physical quota for all node files.
         if bytes > DEFAULT_EXECUTION_SPOOL_BYTES.saturating_sub(usage.used) {
-            return Err(io::Error::other(ReservationDenied(
-                ReservationKind::ExecutionSpool,
-            )));
+            return Err(io::Error::other(ReservationDenied {
+                kind: ReservationKind::ExecutionSpool,
+                requested: bytes,
+                used: usage.used,
+                limit: DEFAULT_EXECUTION_SPOOL_BYTES,
+            }));
         }
         usage.used += bytes;
         usage.peak = usage.peak.max(usage.used);
@@ -380,6 +410,17 @@ mod tests {
         drop(first);
         assert_eq!(budget.snapshot().used, 0);
         assert_eq!(budget.snapshot().peak, u64::MAX);
+    }
+
+    #[test]
+    fn reservation_denials_report_requested_used_and_limit() {
+        let budget = MemoryBudget::new(100);
+        let _held = budget.reserve(80).unwrap();
+        let error = budget.reserve(30).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "node memory reservation allowance exhausted: requested=30 bytes used=80 bytes limit=100 bytes"
+        );
     }
 
     #[test]

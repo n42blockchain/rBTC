@@ -15939,9 +15939,9 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         .unwrap_or_else(|| headers.active_tip().height)
         .min(headers.active_tip().height)
         .saturating_sub(before.height);
-    // Hold the immutable starting identity across attempts. A newly created,
-    // replaced, missing or unreadable stage must never authorize a retry.
-    let initial_stage = ledger
+    // Pin a staged identity across attempts. A stage created by this failed
+    // attempt may be adopted only when it begins at the unchanged next height.
+    let mut expected_stage = ledger
         .staged_manifest()
         .map_err(|error| PeerRunError::ledger(&error))?;
     let mut limit = maximum_batch_size;
@@ -15983,7 +15983,7 @@ async fn download_execute_batch<C: ExecutionChainStore>(
             chainstate.execution_tip().ok(),
             ledger,
             entered_with_scripts || !script_carry.is_empty(),
-            initial_stage.as_ref(),
+            &mut expected_stage,
         ) else {
             return Err(error);
         };
@@ -15995,8 +15995,9 @@ async fn download_execute_batch<C: ExecutionChainStore>(
         prefetch = false;
         replay_prefetch = false;
         rbtc_warn!(
-            "memory admission exhausted before execution commit; reducing validation batch from {attempted} to {smaller} blocks at height {}",
-            before.height
+            "memory admission exhausted before execution commit; reducing validation batch from {attempted} to {smaller} blocks at height {}: {}",
+            before.height,
+            error.message
         );
         limit = smaller;
     }
@@ -16009,7 +16010,7 @@ fn next_memory_retry(
     after: Option<crate::execution_store::ExecutionTip>,
     ledger: &PrunedBlockLedger,
     pending_scripts: bool,
-    expected_stage: Option<&crate::archive::ArchiveManifest>,
+    expected_stage: &mut Option<crate::archive::ArchiveManifest>,
 ) -> Option<usize> {
     if kind != PeerFailureKind::LocalBudget(crate::node_memory::ReservationKind::Memory)
         || attempted <= 1
@@ -16021,10 +16022,22 @@ fn next_memory_retry(
     // This full verification also fails closed for corruption and budget
     // exhaustion. The guard cannot discard or replace a stage to make room.
     let current = ledger.staged_manifest().ok()?;
-    if current.as_ref() != expected_stage {
-        return None;
+    match (expected_stage.as_ref(), current.as_ref()) {
+        (Some(expected), Some(current)) if expected == current => {}
+        (None, None) => {}
+        (None, Some(current))
+            if before.height.checked_add(1) == Some(current.first_height)
+                && current.block_count > 0 =>
+        {
+            // This attempt may have durably staged the downloaded blocks
+            // before memory admission failed. Pin that fully authenticated
+            // archive identity for every smaller retry. The replay still
+            // performs complete consensus validation before any commit.
+            *expected_stage = Some(current.clone());
+        }
+        _ => return None,
     }
-    let attempted = if let Some(stage) = expected_stage {
+    let attempted = if let Some(stage) = expected_stage.as_ref() {
         let offset = before
             .height
             .checked_add(1)?
