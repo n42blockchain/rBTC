@@ -1016,11 +1016,6 @@ async fn stronger_peer_fork_wins_while_a_losing_disk_candidate_remains() {
         },
         _ = batch_processed_rx => {}
     }
-    assert_eq!(
-        crate::header_candidate::DiskHeaderCandidate::stored_anchor(candidate_path(&path)).unwrap(),
-        Some(genesis.hash),
-        "the new peer's competing branch must replace the stale candidate journal"
-    );
     disconnect_peer.send(()).unwrap();
     let error = match sync.await {
         Ok(_) => panic!("the peer disconnected before sending the candidate extension"),
@@ -1029,6 +1024,11 @@ async fn stronger_peer_fork_wins_while_a_losing_disk_candidate_remains() {
     assert_eq!(error.kind, PeerFailureKind::Transient);
     server.await.unwrap();
     drop(peer);
+    assert_eq!(
+        crate::header_candidate::DiskHeaderCandidate::stored_anchor(candidate_path(&path)).unwrap(),
+        Some(genesis.hash),
+        "the new peer's competing branch must replace the stale candidate journal"
+    );
 
     // Rebuild the in-memory state and resume the replacement journal after
     // disconnect, then finish the fork through its new peer.
