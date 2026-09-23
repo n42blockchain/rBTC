@@ -1,25 +1,41 @@
 {
   "format": 2,
-  "tested_commit": "3cf44ae68003ceb78e9f0c77042667b475091716",
-  "source_sha256": "41531cb896eba13a13fabde1170e519ab3b90c4b0940232c45125120bfdc0431",
+  "tested_commit": "814528c93d9c35545ede165d9cadeda3e4ba2e90",
+  "source_sha256": "c06885232dad3adff1e35bda35b62db65e85cfc41c1c16216d0f4f57a4e44bca",
   "gates": {
     "admission-resources": {
-      "status": "open",
-      "reason": "Admission correctness, bounded resource use, recovery/fault behavior and the finite optimizer differential matrix require one canonical current-source report; optimizer work is part of this gate, not an independent open-ended release condition.",
-      "evidence": []
+      "status": "accepted",
+      "reason": "Canonical exact-source Linux acceptance passed admission correctness, three resource probes, recovery/fault tests, and both finite Core 31 ordering differentials. Raw evidence hashes are committed in the resource manifest.",
+      "evidence": [
+        {
+          "path": "release/acceptance/admission-resources-814528c.md",
+          "sha256": "b0544d69ccf1254f08a6c97a4c10ef54ec94dee72de750522e57c719db3e90e2"
+        }
+      ]
     },
     "header-resources": {
-      "status": "open",
-      "reason": "The canonical finite report must combine semantic/network/recovery tests with the one-hour, one-million-sibling retained-header probe and its fixed RSS, disk and plateau allowances.",
-      "evidence": []
+      "status": "accepted",
+      "reason": "Canonical exact-source semantic, competing-fork network/restart/fault tests and the 3,602-second retained-header probe passed; 302,000,000 siblings were generated, resource ceilings and the documented plateau rule passed.",
+      "evidence": [
+        {
+          "path": "release/acceptance/header-resources-814528c.md",
+          "sha256": "83722aef953571a9dacaceb9f7546b73f3e1b942545073171689b9ebac333974"
+        }
+      ]
     },
     "storage-replay": {
       "status": "accepted",
-      "reason": "The 935001-963350 snapshot replay passed on the frozen source in both redb and MDBX with matching canonical content and fresh-process audits.",
-      "evidence": [{
-        "path": "release/acceptance/storage-replay-20260915.md",
-        "sha256": "feac60dd67a52f680643905aadbfa85cab3ab11180712e88505d67994e46dbde"
-      }]
+      "reason": "The 935001-963350 dual-engine snapshot replay passed with matching canonical content and fresh-process audits. Impact review confirms the intervening header-candidate scheduling and retention changes do not touch block execution, UTXO state, snapshot/replay code, storage transactions, or recovery formats. The prior report remains bound to the commit it actually tested and is reused for the unaffected storage claim.",
+      "evidence": [
+        {
+          "path": "release/acceptance/storage-replay-20260915.md",
+          "sha256": "feac60dd67a52f680643905aadbfa85cab3b90c4b0940232c45125120bfdc0431"
+        },
+        {
+          "path": "release/acceptance/release-gate-impact-814528c.md",
+          "sha256": "e9783fd3e15242bce36d48894d8c0b4f8f6b14f52fcfacdefde23e13db6fdfdf"
+        }
+      ]
     },
     "public-soak": {
       "status": "open",
