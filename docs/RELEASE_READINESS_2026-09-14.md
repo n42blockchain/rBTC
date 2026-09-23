@@ -28,13 +28,13 @@ reference a nonempty committed report with its SHA-256. Current entries remain
 open. Missing, edited, untracked, oversized, path-escaping or symlinked reports
 fail closed. Duplicate JSON keys are rejected.
 
-The format-2 manifest binds a frozen `tested_commit` and a recursive SHA-256
-over release-relevant Git tree records. Production, test, dependency, workflow,
-build and acceptance-tool changes invalidate the identity. `docs/`, `README.md`
-and `release/acceptance/` are excluded, so documentation and reviewed reports
-may follow testing without a circular commit reference. Keep executable code
-outside excluded paths. The tested commit must be an ancestor of the release
-commit.
+The format-3 manifest binds a frozen `tested_commit` and a recursive SHA-256
+over runtime, dependency, workflow and build Git tree records. `docs/`,
+`README.md`, `release/acceptance/`, gate checkers/tests and the readiness
+verifier are excluded: they do not enter the node binary, CI tests those tools,
+and resource reports bind the exact checker hash they used. Changes to runtime,
+dependencies, workflow or build inputs invalidate the identity. The tested
+commit must be an ancestor of the release commit.
 
 For public soak, preserve the unedited final report produced by
 `scripts/public-network-soak-report.sh SOAK_DIR` with its default seven-day

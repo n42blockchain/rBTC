@@ -42,12 +42,12 @@ the remaining distribution checks.
   seven-day window for every unrelated patch. Start it only after both networks
   have caught up on the frozen binary. The one-hour header probe is one-time
   resource calibration; later runs should be impact-based.
-- Exact-source evidence is useful when a change touches the tested behavior.
-  A report must retain the commit and digest it actually tested. An explicit,
-  reviewed impact analysis can reuse it for an unaffected gate; silently
-  relabeling an old report is never acceptable. The current readiness verifier
-  enforces exact-source reports for admission and header gates, so any impact
-  review must be made machine-checkable before it can replace that enforcement.
+- Runtime/build source identity must stay exact. The source digest now excludes
+  documentation, gate checkers/tests, and the readiness verifier because they
+  do not enter the node binary; CI validates those tools, and each resource
+  report records the exact checker SHA-256 it used. A report must retain the
+  commit and runtime digest it actually tested. Silently relabeling old results
+  is never acceptable.
 - CI branch eligibility, report layout, and fixed synthetic workload sizes are
   repository workflow choices. Keep them only where they improve reproducible
   safety evidence; do not let them trigger unrelated implementation work.

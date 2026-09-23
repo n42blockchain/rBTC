@@ -20,8 +20,8 @@ import sys
 EVIDENCE_DIR = "release/acceptance"
 GATES = ("admission-resources", "header-resources", "storage-replay", "public-soak")
 MAX_REPORT_BYTES = 2 * 1024 * 1024
-NON_RUNTIME_PREFIXES = (EVIDENCE_DIR + "/", "docs/")
-NON_RUNTIME_FILES = {"README.md"}
+NON_RUNTIME_PREFIXES = (EVIDENCE_DIR + "/", "docs/", "scripts/check-", "scripts/test-")
+NON_RUNTIME_FILES = {"README.md", "scripts/verify-release-readiness.py"}
 
 
 def git(root, *args):
@@ -30,10 +30,11 @@ def git(root, *args):
 
 def source_digest(root, revision):
     records = git(root, "ls-tree", "-rz", "-r", "--full-tree", revision).split(b"\0")
-    # Bind every release-relevant file recursively, including file modes and
-    # symlinks. Human documentation and reviewed evidence cannot change the
-    # executable, dependency graph, build, workflow or acceptance tooling, so
-    # those files may follow a frozen candidate without invalidating its tests.
+    # Bind the runtime, dependency graph, build and release workflow recursively,
+    # including file modes and symlinks. Documentation, evidence, gate checkers,
+    # gate tests, and this verifier are policy tooling rather than binary inputs.
+    # CI tests that tooling, and each resource report binds the checker hash it
+    # used, so editing it must not pretend the tested node binary changed.
     def relevant(row):
         if not row:
             return False
@@ -110,7 +111,7 @@ def verify_soak(report, tested_commit):
             raise ValueError(f"soak is missing {name}")
 
 
-def verify_resource_report(report, gate, tested_commit, source_sha256):
+def verify_resource_report(root, report, gate, tested_commit, source_sha256):
     def field(name):
         matches = re.findall(r"^- " + re.escape(name) + r": `([^`]+)`$", report, re.MULTILINE)
         if len(matches) != 1:
@@ -123,6 +124,16 @@ def verify_resource_report(report, gate, tested_commit, source_sha256):
         raise ValueError(f"{gate} report tested a different commit")
     if field("Source SHA-256") != source_sha256:
         raise ValueError(f"{gate} report tested a different source digest")
+    checker = {
+        "admission-resources": "scripts/check-admission-resource-probe.py",
+        "header-resources": "scripts/check-header-resource-probe.py",
+    }[gate]
+    checker_path = root / checker
+    if checker_path.is_symlink() or not checker_path.is_file():
+        raise ValueError(f"{gate} acceptance checker is missing or unsafe")
+    checker_sha256 = hashlib.sha256(checker_path.read_bytes()).hexdigest()
+    if field("Acceptance checker SHA-256") != checker_sha256:
+        raise ValueError(f"{gate} report checker SHA-256 does not match committed tooling")
     if field("Acceptance status") != "PASS":
         raise ValueError(f"{gate} acceptance is not PASS")
     required = {
@@ -146,7 +157,7 @@ def verify(root):
     if git(root, "show", "HEAD:" + EVIDENCE_DIR + "/readiness.json") != payload:
         raise ValueError("readiness manifest differs from HEAD")
     data = json.loads(payload, object_pairs_hook=unique_object)
-    if set(data) != {"format", "tested_commit", "source_sha256", "gates"} or data["format"] != 2:
+    if set(data) != {"format", "tested_commit", "source_sha256", "gates"} or data["format"] != 3:
         raise ValueError("unsupported readiness manifest")
     gates = data["gates"]
     if not isinstance(gates, dict) or set(gates) != set(GATES):
@@ -186,7 +197,7 @@ def verify(root):
         elif name in ("admission-resources", "header-resources"):
             if len(reports) != 1:
                 raise ValueError(f"{name} requires one canonical final report")
-            verify_resource_report(reports[0], name, commit, expected)
+            verify_resource_report(root, reports[0], name, commit, expected)
     return commit
 
 

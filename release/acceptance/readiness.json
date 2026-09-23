@@ -1,31 +1,31 @@
 {
-  "format": 2,
-  "tested_commit": "814528c93d9c35545ede165d9cadeda3e4ba2e90",
-  "source_sha256": "c06885232dad3adff1e35bda35b62db65e85cfc41c1c16216d0f4f57a4e44bca",
+  "format": 3,
+  "tested_commit": "f808a880e6d0536958f12b0f06b0fea153a62249",
+  "source_sha256": "aa12f0141ee8ec579f70fee9085c31bf895d949341415ef3e8e536cb2ece51f7",
   "gates": {
     "admission-resources": {
       "status": "accepted",
-      "reason": "Canonical exact-source Linux acceptance passed admission correctness, three resource probes, recovery/fault tests, and both finite Core 31 ordering differentials. Raw evidence hashes are committed in the resource manifest.",
+      "reason": "The frozen f808a88 runtime passed admission correctness and recovery tests, three resource probes, and both finite Core 31 ordering differentials. The report binds the exact checker hash and raw evidence manifest.",
       "evidence": [
         {
-          "path": "release/acceptance/admission-resources-814528c.md",
-          "sha256": "b0544d69ccf1254f08a6c97a4c10ef54ec94dee72de750522e57c719db3e90e2"
+          "path": "release/acceptance/admission-resources-f808a88.md",
+          "sha256": "4d925f193c357ecc835ce4104d2156c698a2621cdcc1d542de32605908e8953e"
         }
       ]
     },
     "header-resources": {
       "status": "accepted",
-      "reason": "Canonical exact-source semantic, competing-fork network/restart/fault tests and the 3,602-second retained-header probe passed; 302,000,000 siblings were generated, resource ceilings and the documented plateau rule passed.",
+      "reason": "The frozen f808a88 runtime passed semantic, competing-fork network/restart/fault tests and a 3,609-second retained-header probe over 301,000,000 siblings. Peak RSS/disk stayed under hard ceilings; the final two ten-minute plateau ratio was 1.03962. The report binds the exact checker hash and raw evidence manifest.",
       "evidence": [
         {
-          "path": "release/acceptance/header-resources-814528c.md",
-          "sha256": "83722aef953571a9dacaceb9f7546b73f3e1b942545073171689b9ebac333974"
+          "path": "release/acceptance/header-resources-f808a88.md",
+          "sha256": "e61aa51559eba7e16ad9071f56cc0c6d8a05e25d7d73998298a7c03ec3781fac"
         }
       ]
     },
     "storage-replay": {
       "status": "accepted",
-      "reason": "The 935001-963350 dual-engine snapshot replay passed with matching canonical content and fresh-process audits. Impact review confirms the intervening header-candidate scheduling and retention changes do not touch block execution, UTXO state, snapshot/replay code, storage transactions, or recovery formats. The prior report remains bound to the commit it actually tested and is reused for the unaffected storage claim.",
+      "reason": "The 935001-963350 dual-engine snapshot replay remains bound to its actual source and passed matching-content and fresh-process audits. The f808a88 pre-commit batch retry does not change successful block execution or storage transitions; current-source forced-memory retry tests cover its separate failure path. Impact reviews preserve the report's original identity.",
       "evidence": [
         {
           "path": "release/acceptance/storage-replay-20260915.md",
@@ -34,6 +34,10 @@
         {
           "path": "release/acceptance/release-gate-impact-814528c.md",
           "sha256": "e9783fd3e15242bce36d48894d8c0b4f8f6b14f52fcfacdefde23e13db6fdfdf"
+        },
+        {
+          "path": "release/acceptance/storage-replay-impact-f808a88.md",
+          "sha256": "17382be867919710090a87cee3a693401914034f784a586d64d812f33f544e7d"
         }
       ]
     },

@@ -59,10 +59,16 @@ def check(rows, *, seconds, max_rss, max_disk, growth=1.10):
         errors.append("sampled RSS exceeds allowance")
     if peak_disk > max_disk:
         errors.append("sampled disk exceeds allowance")
-    # Ignore ramp-up. Compare the middle and final third at the same phase.
+    # Check the final two ten-minute windows at the same retention phase.
+    # Comparing the full middle/final thirds can mistake late redb page-cache
+    # warm-up for continuing growth when the memory curve settles afterwards.
+    window_seconds = max(1, seconds // 6)
+    plateau_end = duration
+    plateau_split = plateau_end - window_seconds
+    plateau_start = plateau_split - window_seconds
     steady = [r for r in churn if r["phase"] == "siblings" and r["side_entries"] == 50_000]
-    middle = [r for r in steady if duration / 3 <= r["elapsed_micros"] / 1e6 < 2 * duration / 3]
-    final = [r for r in steady if r["elapsed_micros"] / 1e6 >= 2 * duration / 3]
+    middle = [r for r in steady if plateau_start <= r["elapsed_micros"] / 1e6 < plateau_split]
+    final = [r for r in steady if plateau_split <= r["elapsed_micros"] / 1e6 <= plateau_end]
     ratios = {}
     if min(len(middle), len(final)) < 10:
         errors.append("insufficient plateau samples")
@@ -74,6 +80,7 @@ def check(rows, *, seconds, max_rss, max_disk, growth=1.10):
     return {"passed": not errors, "errors": sorted(set(errors)), "duration_seconds": duration,
             "generated_siblings": completed[0]["generated_siblings"], "samples": len(samples),
             "peak_sampled_rss_bytes": peak_rss, "peak_sampled_disk_bytes": peak_disk,
+            "plateau_window_seconds": window_seconds,
             "plateau_median_ratios": ratios, "fresh_reopen_rss_bytes": fresh[0]["rss_kib"] * 1024}
 
 

@@ -51,7 +51,7 @@ correctness.
 
 ## Required gates
 
-`release/acceptance/readiness.json` format 2 has exactly four gates:
+`release/acceptance/readiness.json` format 3 has exactly four gates:
 
 1. `admission-resources` covers admission correctness, finite optimizer
    differential checks, bounded resource behavior and recovery/fault behavior.
@@ -78,8 +78,12 @@ admission, optimizer, header semantic/network/recovery tests; three fresh
 256-entry/eight-clone admission probes; and a one-hour retained-header workload
 that generates at least one million siblings. The fixed component allowances
 are 512 MiB peak RSS for both probes, 64 MiB admission clone RSS delta, 256 MiB
-header database allocation and at most 10% median plateau growth. Timing bounds
-are deliberately broad regression ceilings, not performance promises.
+header database allocation and at most 10% median growth between the final two
+consecutive ten-minute windows. The plateau comparison uses the same retained-
+header phase in both windows; full-run RSS and disk ceilings still apply to
+every sample. This lets the workload warm the database and allocator before
+measuring continued growth. Timing bounds are deliberately broad regression
+ceilings, not performance promises.
 
 The command emits exactly one canonical report for each resource gate. Review
 the raw logs and hashes before copying those reports to `release/acceptance/`.

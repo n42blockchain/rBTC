@@ -42,11 +42,20 @@ class CheckTest(unittest.TestCase):
     def test_plateau_growth_is_rejected_below_absolute_ceiling(self):
         rows = evidence()
         for row in rows:
-            if row.get("phase") == "siblings" and row["elapsed_micros"] >= 400_000_000:
+            if row.get("phase") == "siblings" and row["elapsed_micros"] >= 500_000_000:
                 row["rss_kib"] = 150
         result = self.check(rows)
         self.assertFalse(result["passed"])
         self.assertIn("rss_kib plateau growth exceeds allowance", result["errors"])
+
+    def test_late_one_time_warmup_step_does_not_fail_a_stable_final_plateau(self):
+        rows = evidence()
+        for row in rows:
+            if row.get("phase") in {"siblings", "before-retention"} \
+                    and row["elapsed_micros"] >= 400_000_000:
+                row["rss_kib"] = 112
+        result = self.check(rows)
+        self.assertTrue(result["passed"], result["errors"])
 
     def test_false_reopen_and_missing_samples_are_rejected(self):
         rows = evidence()

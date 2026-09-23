@@ -25,6 +25,10 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.git("config", "user.name", "Release Test")
         self.git("config", "user.email", "test@example.invalid")
         (self.root / "source.rs").write_text("// frozen synthetic fixture\n")
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        for name in ("check-admission-resource-probe.py", "check-header-resource-probe.py"):
+            (scripts / name).write_text("# synthetic checker\n")
         self.commit("test: freeze synthetic source")
         self.tested = self.git("rev-parse", "HEAD").decode().strip()
         self.directory = self.root / readiness.EVIDENCE_DIR
@@ -61,10 +65,11 @@ class ReleaseReadinessTests(unittest.TestCase):
                 "# Synthetic resource fixture, never release evidence\n"
                 f"- Gate: `{gate}`\n- Commit: `{self.tested}`\n" +
                 f"- Source SHA-256: `{source_sha256}`\n" +
+                f"- Acceptance checker SHA-256: `{hashlib.sha256((scripts / ('check-' + gate.replace('-resources', '-resource-probe') + '.py')).read_bytes()).hexdigest()}`\n" +
                 "".join(f"- {field}: `PASS`\n" for field in fields) +
                 "- Acceptance status: `PASS`\n")
             self.resource_reports[gate] = path
-        self.data = {"format": 2, "tested_commit": self.tested,
+        self.data = {"format": 3, "tested_commit": self.tested,
                      "source_sha256": source_sha256,
                      "gates": {name: {"status": "accepted", "reason": "Synthetic test only",
                                       "evidence": [self.record(
@@ -105,12 +110,31 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.commit("test: change fixture workflow")
         self.reject("source differs")
 
+    def test_changed_runtime_source_invalidates_evidence(self):
+        (self.root / "source.rs").write_text("// changed runtime fixture\n")
+        self.commit("test: change runtime fixture")
+        self.reject("source differs")
+
     def test_documentation_only_commit_preserves_frozen_identity(self):
         documentation = self.root / "docs" / "policy.md"
         documentation.parent.mkdir()
         documentation.write_text("Synthetic policy clarification.\n")
         self.commit("docs: clarify synthetic policy")
         self.assertEqual(readiness.verify(self.root), self.tested)
+
+    def test_acceptance_harness_changes_do_not_change_runtime_source_identity(self):
+        scripts = self.root / "scripts"
+        scripts.mkdir(exist_ok=True)
+        checker = scripts / "check-header-resource-probe.py"
+        validator = scripts / "verify-release-readiness.py"
+        checker.write_text("# original synthetic checker\n")
+        validator.write_text("# original synthetic validator\n")
+        self.commit("test: add synthetic acceptance harness")
+        frozen = readiness.source_digest(self.root, "HEAD")
+        checker.write_text("# revised synthetic checker\n")
+        validator.write_text("# revised synthetic validator\n")
+        self.commit("test: revise synthetic acceptance harness")
+        self.assertEqual(readiness.source_digest(self.root, "HEAD"), frozen)
 
     def test_dirty_source_is_rejected(self):
         (self.root / "source.rs").write_text("// uncommitted change\n")
@@ -143,8 +167,13 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.save()
         self.reject("every required production gate")
 
+    def test_old_manifest_format_is_rejected(self):
+        self.data["format"] = 2
+        self.save()
+        self.reject("unsupported readiness manifest")
+
     def test_duplicate_json_key(self):
-        self.manifest.write_text(self.manifest.read_text().replace('"format": 2', '"format": 2, "format": 2'))
+        self.manifest.write_text(self.manifest.read_text().replace('"format": 3', '"format": 3, "format": 3'))
         self.commit("test: duplicate fixture field")
         self.reject("duplicate JSON key")
 
@@ -212,6 +241,12 @@ class ReleaseReadinessTests(unittest.TestCase):
             self.data["gates"]["admission-resources"]["evidence"] = [self.record(path)]
             self.save()
             self.reject("admission-resources")
+
+    def test_resource_report_must_bind_the_acceptance_checker(self):
+        checker = self.root / "scripts" / "check-header-resource-probe.py"
+        checker.write_text("# changed checker\n")
+        self.commit("test: change synthetic acceptance checker")
+        self.reject("checker SHA-256")
 
 
 if __name__ == "__main__":
