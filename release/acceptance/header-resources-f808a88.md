@@ -4,10 +4,13 @@
 - Commit: `f808a880e6d0536958f12b0f06b0fea153a62249`
 - Source SHA-256: `aa12f0141ee8ec579f70fee9085c31bf895d949341415ef3e8e536cb2ece51f7`
 - Acceptance checker SHA-256: `3cdb48ce7428823715db19f27bb562cc1aed6445a61e2fd8a4a6793fc6fa8b3e`
-- Functional test status: `PASS` (17 passed, 1 ignored)
+- Functional test status: `PASS`
+- Functional test counts: 17 passed, 1 ignored
 - Semantic comparison status: `PASS`
-- Sustained probe status: `PASS` (3,609.35 seconds; 301,000,000 siblings)
-- Restart/fault status: `PASS` (12 header-store retention tests passed, 1 ignored)
+- Sustained probe status: `PASS`
+- Sustained probe workload: 3,609.35 seconds; 301,000,000 siblings
+- Restart/fault status: `PASS`
+- Restart/fault test counts: 12 header-store retention tests passed, 1 ignored
 - Peak sampled RSS: `421,343,232` bytes of `536,870,912`
 - Peak sampled database disk: `67,907,584` bytes of `268,435,456`
 - Final-two-window median ratios (RSS, database length, allocated disk): `1.03962`, `1.00000`, `1.00000`

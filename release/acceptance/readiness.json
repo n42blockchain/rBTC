@@ -9,7 +9,7 @@
       "evidence": [
         {
           "path": "release/acceptance/admission-resources-f808a88.md",
-          "sha256": "4d925f193c357ecc835ce4104d2156c698a2621cdcc1d542de32605908e8953e"
+          "sha256": "32d085ad22d2f95186a6a9c413fd697a5e5decc6fa5ee55a755209fe55c558c3"
         }
       ]
     },
@@ -19,7 +19,7 @@
       "evidence": [
         {
           "path": "release/acceptance/header-resources-f808a88.md",
-          "sha256": "e61aa51559eba7e16ad9071f56cc0c6d8a05e25d7d73998298a7c03ec3781fac"
+          "sha256": "70089eda672a160cc933192e6d8dad89c3bafa9cdac3931a222a79934207a449"
         }
       ]
     },
