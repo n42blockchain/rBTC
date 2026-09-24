@@ -26,7 +26,7 @@ printf '%s\n%s\n' \
   '{"message":"block execution caught up at height 42"}' \
   >"$soak_dir/logs/bitcoin/rbtc.log"
 printf '%s\n%s\n' \
-  '{"message":"peer returned no more headers at 84:0000000000000000000000000000000000000000000000000000000000000002"}' \
+  '{"message":"peer returned no more headers at 84:0000000000000000000000000000000000000000000000000000000000000002 (pending_disk_candidate=false)"}' \
   '{"message":"block execution caught up at height 84"}' \
   >"$soak_dir/logs/testnet4/rbtc.log"
 printf '%s\n' "$$" >"$test_root/bitcoin.pid"

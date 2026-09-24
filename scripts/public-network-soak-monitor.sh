@@ -171,7 +171,10 @@ sample_tip() {
     header=$(
       tail -n 2000 "$log_file" |
         jq -rR 'fromjson? | .message // empty' |
-        sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' |
+        sed -n \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\) (pending_disk_candidate=false)$/\1\t\2/p' \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\) (pending_disk_candidate=true)$/\1\t\2/p' |
         tail -n 1
     )
     execution=$(
@@ -183,7 +186,10 @@ sample_tip() {
   else
     header=$(
       tail -n 2000 "$log_file" |
-        sed -n 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' |
+        sed -n \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\)$/\1\t\2/p' \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\) (pending_disk_candidate=false)$/\1\t\2/p' \
+          -e 's/^peer returned no more headers at \([0-9][0-9]*\):\([0-9a-f][0-9a-f]*\) (pending_disk_candidate=true)$/\1\t\2/p' |
         tail -n 1
     )
     execution=$(
