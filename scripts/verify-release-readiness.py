@@ -227,9 +227,11 @@ def verify(root):
                  ":(exclude)README.md")
     if status:
         raise ValueError("release-relevant working tree differs from HEAD")
-    if failures:
-        raise ValueError("open release gates:\n  " + "\n  ".join(failures))
     for name in GATES:
+        if gates[name]["status"] != "accepted":
+            continue
+        if not gates[name]["evidence"]:
+            continue
         reports = [read_report(root, record) for record in gates[name]["evidence"]]
         if name == "public-soak":
             if len(reports) != 1:
@@ -239,6 +241,8 @@ def verify(root):
             if len(reports) != 1:
                 raise ValueError(f"{name} requires one canonical final report")
             verify_resource_report(root, reports[0], name, commit, frozen_digest)
+    if failures:
+        raise ValueError("open release gates:\n  " + "\n  ".join(failures))
     return commit
 
 
