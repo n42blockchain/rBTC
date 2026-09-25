@@ -29,7 +29,7 @@
       "evidence": [
         {
           "path": "release/acceptance/storage-replay-20260915.md",
-          "sha256": "feac60dd67a52f680643905aadbfa85cab3b90c4b0940232c45125120bfdc0431"
+          "sha256": "feac60dd67a52f680643905aadbfa85cab3ab11180712e88505d67994e46dbde"
         },
         {
           "path": "release/acceptance/release-gate-impact-814528c.md",
