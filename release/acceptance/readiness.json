@@ -1,5 +1,5 @@
 {
-  "format": 3,
+  "format": 4,
   "tested_commit": "f808a880e6d0536958f12b0f06b0fea153a62249",
   "source_sha256": "aa12f0141ee8ec579f70fee9085c31bf895d949341415ef3e8e536cb2ece51f7",
   "gates": {
@@ -46,5 +46,9 @@
       "reason": "No accepted 604800-second Bitcoin and Testnet4 report exists for frozen release source.",
       "evidence": []
     }
+  },
+  "source_impact": {
+    "path": "release/acceptance/sampling-tool-impact-f808a88.json",
+    "sha256": "9e61bc9eb629a71c660a9ca405cd3d4434496be23d8fae402f466dd154288e2b"
   }
 }

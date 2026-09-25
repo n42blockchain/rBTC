@@ -1,0 +1,16 @@
+{
+  "base_blob": "b49a7ee12982b70cd1e7777b42757431695e2e46",
+  "base_commit": "f808a880e6d0536958f12b0f06b0fea153a62249",
+  "base_source_sha256": "aa12f0141ee8ec579f70fee9085c31bf895d949341415ef3e8e536cb2ece51f7",
+  "changed_source_paths": [
+    "scripts/public-network-soak-monitor.sh"
+  ],
+  "format": 1,
+  "impact": "sampling-tool-only",
+  "target_blob": "4fc08f2d2202c3647d9b1a929de95163220440e6",
+  "target_commit": "ec6db4e55a329abcc4a1d6483964a483f0e979f7",
+  "target_source_sha256": "4c1cef2a2851ac690e1168f09531c40dd465b530a75a7c2d7a412919f49ba7fb",
+  "validation": "monitor-parser-tests-pass",
+  "validation_commit": "ec6db4e55a329abcc4a1d6483964a483f0e979f7",
+  "validation_run_id": "36059830642"
+}

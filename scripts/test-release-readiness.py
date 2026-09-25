@@ -27,6 +27,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         (self.root / "source.rs").write_text("// frozen synthetic fixture\n")
         scripts = self.root / "scripts"
         scripts.mkdir(exist_ok=True)
+        (scripts / "public-network-soak-monitor.sh").write_text("# sampling monitor v1\n")
         for name in ("check-admission-resource-probe.py", "check-header-resource-probe.py"):
             (scripts / name).write_text("# synthetic checker\n")
         self.commit("test: freeze synthetic source")
@@ -69,8 +70,9 @@ class ReleaseReadinessTests(unittest.TestCase):
                 "".join(f"- {field}: `PASS`\n" for field in fields) +
                 "- Acceptance status: `PASS`\n")
             self.resource_reports[gate] = path
-        self.data = {"format": 3, "tested_commit": self.tested,
+        self.data = {"format": 4, "tested_commit": self.tested,
                      "source_sha256": source_sha256,
+                     "source_impact": None,
                      "gates": {name: {"status": "accepted", "reason": "Synthetic test only",
                                       "evidence": [self.record(
                                           self.report if name == "public-soak" else
@@ -108,12 +110,47 @@ class ReleaseReadinessTests(unittest.TestCase):
     def test_changed_source_or_workflow_invalidates_evidence(self):
         (self.root / "release.yml").write_text("changed release behavior\n")
         self.commit("test: change fixture workflow")
-        self.reject("source differs")
+        self.reject("source impact review")
 
     def test_changed_runtime_source_invalidates_evidence(self):
         (self.root / "source.rs").write_text("// changed runtime fixture\n")
         self.commit("test: change runtime fixture")
-        self.reject("source differs")
+        self.reject("source impact review")
+
+    def test_sampling_tool_delta_requires_explicit_impact_review(self):
+        monitor = self.root / "scripts" / "public-network-soak-monitor.sh"
+        monitor.write_text("# sampling monitor v2\n")
+        self.commit("fix: tighten sampling monitor parsing")
+        self.reject("impact review")
+
+    def test_reviewed_sampling_tool_delta_preserves_original_report_identity(self):
+        monitor = self.root / "scripts" / "public-network-soak-monitor.sh"
+        base_digest = self.data["source_sha256"]
+        base_blob = self.git("rev-parse", self.tested + ":scripts/public-network-soak-monitor.sh").decode().strip()
+        monitor.write_text("# sampling monitor v2\n")
+        self.commit("fix: tighten sampling monitor parsing")
+        target = self.git("rev-parse", "HEAD").decode().strip()
+        target_digest = readiness.source_digest(self.root, "HEAD")
+        review = {"format": 1, "base_commit": self.tested, "base_source_sha256": base_digest,
+                  "target_commit": target, "target_source_sha256": target_digest,
+                  "changed_source_paths": ["scripts/public-network-soak-monitor.sh"],
+                  "base_blob": base_blob,
+                  "target_blob": self.git("rev-parse", "HEAD:scripts/public-network-soak-monitor.sh").decode().strip(),
+                  "impact": "sampling-tool-only",
+                  "validation": "monitor-parser-tests-pass", "validation_commit": target,
+                  "validation_run_id": "123456789"}
+        impact_path = self.directory / "sampling-tool-impact.json"
+        impact_path.write_text(json.dumps(review, sort_keys=True) + "\n")
+        self.data["source_impact"] = self.record(impact_path)
+        self.save()
+        self.assertEqual(readiness.verify(self.root), self.tested)
+
+    def test_sampling_tool_review_cannot_cover_another_runtime_change(self):
+        monitor = self.root / "scripts" / "public-network-soak-monitor.sh"
+        monitor.write_text("# sampling monitor v2\n")
+        (self.root / "source.rs").write_text("// runtime changed too\n")
+        self.commit("fix: change monitor and runtime")
+        self.reject("impact review")
 
     def test_documentation_only_commit_preserves_frozen_identity(self):
         documentation = self.root / "docs" / "policy.md"
@@ -168,12 +205,12 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.reject("every required production gate")
 
     def test_old_manifest_format_is_rejected(self):
-        self.data["format"] = 2
+        self.data["format"] = 3
         self.save()
         self.reject("unsupported readiness manifest")
 
     def test_duplicate_json_key(self):
-        self.manifest.write_text(self.manifest.read_text().replace('"format": 3', '"format": 3, "format": 3'))
+        self.manifest.write_text(self.manifest.read_text().replace('"format": 4', '"format": 4, "format": 4'))
         self.commit("test: duplicate fixture field")
         self.reject("duplicate JSON key")
 
