@@ -8,6 +8,7 @@ use crate::admission_resources::{AdmissionBudget, AdmissionDeferred, AdmissionSt
 use crate::feerate_diagram::{Cluster, DEFAULT_OPTIMIZER_WORK, LinearizationResult};
 
 const MAX_CACHED_CLUSTERS: usize = 64;
+pub(super) const CLUSTER_SCAN_WORK: u64 = 64 * 64 * 64;
 
 #[derive(Clone)]
 struct CachedCluster {
@@ -35,7 +36,7 @@ impl LinearizationCache {
         cluster: &Cluster,
         budget: &AdmissionBudget,
     ) -> Result<LinearizationResult, AdmissionDeferred> {
-        budget.charge(AdmissionStage::Graph, 64 * 64 * 64)?;
+        budget.charge(AdmissionStage::Graph, CLUSTER_SCAN_WORK)?;
         let mut cache = self.0.lock().expect("linearization cache lock");
         if let Some(existing) = cache
             .iter()

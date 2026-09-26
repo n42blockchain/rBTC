@@ -590,9 +590,9 @@ impl TransactionAdmissionPool {
     }
 
     /// Conservative upper bound of every stage charge this candidate could
-    /// incur across `admit_package_at`/`admit_package_inner`, computed
-    /// purely from static transaction shape (no store access), so it can
-    /// gate the candidate before any stage work begins.
+    /// incur across `admit_package_at`/`admit_package_inner`, computed from
+    /// transaction shape and retained pool indexes without UTXO-store access,
+    /// so it can gate the candidate before any stage work begins.
     ///
     /// For already-admitted entries the exact, previously validated
     /// `sigop_cost` is reused, which is a true bound (it cannot regress on
@@ -617,6 +617,7 @@ impl TransactionAdmissionPool {
             self.entries.len(),
             transactions.len(),
         ));
+        total = total.saturating_add(self.replacement_diagram_work_estimate(transactions));
         for entry in &self.entries {
             total = total.saturating_add(apply_to_overlay_estimate(
                 &entry.transaction,
@@ -624,6 +625,83 @@ impl TransactionAdmissionPool {
             ));
         }
         total
+    }
+
+    /// Worst-case Graph work for the old and new replacement diagrams.
+    ///
+    /// The old diagram visits at most one cluster per direct-conflict or
+    /// in-pool-parent root. Each such cluster is capped at 64 transactions;
+    /// after eviction, every surviving member and every incoming transaction
+    /// can account for at most one new cluster. A cache miss charges both the
+    /// fixed cluster scan and the complete optimizer allowance, so use that
+    /// combined amount for every possible linearization.
+    fn replacement_diagram_work_estimate(&self, transactions: &[Transaction]) -> u64 {
+        let is_new =
+            |transaction: &Transaction| !self.positions.contains_key(&transaction.compute_txid());
+        let new_transaction_count = transactions
+            .iter()
+            .filter(|transaction| is_new(transaction))
+            .count();
+        if new_transaction_count == 0 {
+            return 0;
+        }
+
+        let mut conflict_roots = transactions
+            .iter()
+            .filter(|transaction| is_new(transaction))
+            .flat_map(|transaction| transaction.input.iter())
+            .filter_map(|input| self.spent.get(&input.previous_output).copied())
+            .collect::<BTreeSet<_>>();
+
+        if transactions.len() == 1 && is_new(&transactions[0]) {
+            let candidate = &transactions[0];
+            if candidate.version.0 == TRUC_VERSION {
+                for input in &candidate.input {
+                    let parent = input.previous_output.txid;
+                    if self
+                        .entry(parent)
+                        .is_none_or(|entry| entry.transaction.version.0 != TRUC_VERSION)
+                    {
+                        continue;
+                    }
+                    let siblings = self
+                        .children(parent)
+                        .filter(|sibling| !conflict_roots.contains(sibling))
+                        .collect::<BTreeSet<_>>();
+                    if siblings.len() == 1 {
+                        conflict_roots.extend(siblings);
+                    }
+                }
+            }
+        }
+
+        // Replacement is refused before diagram construction when the number
+        // of direct conflicts alone exceeds the descendant-eviction ceiling.
+        if conflict_roots.is_empty() || conflict_roots.len() > MAX_REPLACEMENT_EVICTIONS {
+            return 0;
+        }
+
+        let mut roots = conflict_roots;
+        roots.extend(
+            transactions
+                .iter()
+                .filter(|transaction| is_new(transaction))
+                .flat_map(|transaction| {
+                    transaction
+                        .input
+                        .iter()
+                        .map(|input| input.previous_output.txid)
+                        .filter(|parent| self.positions.contains_key(parent))
+                }),
+        );
+        let old_clusters = u64::try_from(roots.len()).unwrap_or(u64::MAX);
+        let new_clusters = old_clusters
+            .saturating_mul(u64::try_from(MAX_MEMPOOL_CLUSTER_TRANSACTIONS).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(new_transaction_count).unwrap_or(u64::MAX));
+        let linearizations = old_clusters.saturating_add(new_clusters);
+        let per_linearization = linearization_cache::CLUSTER_SCAN_WORK
+            .saturating_add(crate::feerate_diagram::DEFAULT_OPTIMIZER_WORK);
+        linearizations.saturating_mul(per_linearization)
     }
 
     /// Creates an empty pool with node-validated resource ceilings.

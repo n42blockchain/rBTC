@@ -323,6 +323,118 @@ fn sigop_worst_case_bound_defers_up_front_without_store_lookups() {
 }
 
 #[test]
+fn replacement_diagram_work_is_included_in_the_up_front_candidate_estimate() {
+    const CLUSTERS: usize = 3;
+    const PARENTS_PER_CLUSTER: usize = MAX_MEMPOOL_CLUSTER_TRANSACTIONS - 1;
+
+    let (_directory, store) = store();
+    let mut rbf_context = context();
+    rbf_context.full_rbf = true;
+    let mut source = Vec::new();
+    for index in 1..=(CLUSTERS * PARENTS_PER_CLUSTER) {
+        source.push(spend(u8::try_from(index).unwrap()));
+    }
+    store
+        .apply(
+            &[],
+            &source
+                .iter()
+                .map(|(outpoint, utxo, _)| ((*outpoint).into(), utxo.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    let mut pool = TransactionAdmissionPool::with_capacity(512, 256 * 1024 * 1024);
+    let mut parents = Vec::with_capacity(source.len());
+    for (_, _, parent) in source {
+        pool.admit(&store, parent.clone(), rbf_context).unwrap();
+        parents.push(parent);
+    }
+
+    let witness_script = Builder::new().push_opcode(opcodes::OP_TRUE).into_script();
+    let mut conflict_inputs = Vec::with_capacity(CLUSTERS);
+    for group in parents.chunks(PARENTS_PER_CLUSTER) {
+        let inputs = group
+            .iter()
+            .map(|parent| TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[witness_script.as_bytes()]),
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs,
+            output: vec![TxOut {
+                value: Amount::from_sat(u64::try_from(group.len()).unwrap() * 90_000 - 10_000),
+                script_pubkey: ScriptBuf::new_p2wsh(&witness_script.wscript_hash()),
+            }],
+        };
+        pool.admit(&store, transaction.clone(), rbf_context)
+            .unwrap();
+        conflict_inputs.push(transaction.input[0].previous_output);
+    }
+
+    let replacement = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: conflict_inputs
+            .into_iter()
+            .map(|previous_output| TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[witness_script.as_bytes()]),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(70_000),
+            script_pubkey: ScriptBuf::new_p2wsh(&witness_script.wscript_hash()),
+        }],
+    };
+
+    // This is the former estimate: it accounts for transaction graph shape,
+    // but not the three old clusters and resulting clusters whose diagrams
+    // are independently linearized while evaluating this replacement.
+    let former_estimate = 1_u64
+        + payload_traversal_charge(&replacement)
+        + payload_bytes_charge(&replacement)
+        + apply_to_overlay_estimate(&replacement, None)
+        + u64::try_from(pool.metadata_reservation_bytes()).unwrap()
+        + graph_charge_estimate(pool.entries.len(), 1)
+        + pool
+            .entries
+            .iter()
+            .map(|entry| apply_to_overlay_estimate(&entry.transaction, Some(entry.sigop_cost)))
+            .sum::<u64>();
+    let budget = AdmissionBudget::new(AdmissionResourceLimits {
+        work_burst: former_estimate,
+        work_per_second: 0,
+        candidate_bytes: 16 * 1024 * 1024,
+    });
+    pool = pool.with_admission_budget(budget.clone());
+    let counting = CountingStore::new(&store);
+
+    let error = pool.admit(&counting, replacement, rbf_context).unwrap_err();
+    assert!(
+        matches!(error, TransactionAdmissionError::CandidateUnfittable(_)),
+        "the total-capacity preflight must include replacement diagram work: {error:?}"
+    );
+    assert_eq!(
+        budget.snapshot().charged,
+        [0; 6],
+        "an unfittable replacement must be refused before stage work"
+    );
+    assert_eq!(
+        counting.get_calls(),
+        0,
+        "the base store must not be touched when preflight refuses the replacement"
+    );
+}
+
+#[test]
 fn prevout_script_clone_is_charged_under_script_stage() {
     let (_directory, store) = store();
     let (outpoint, utxo, tx) = spend(1);
