@@ -1294,6 +1294,7 @@ fn restrict_wallet_file(path: &Path) -> Result<(), std::io::Error> {
 mod tests {
     use std::collections::HashSet;
 
+    use bdk_wallet::{descriptor::IntoWalletDescriptor, signer::SignersContainer};
     use bitcoin::{
         Address, Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
         absolute::LockTime, blockdata::constants::genesis_block, hashes::Hash,
@@ -1345,6 +1346,40 @@ mod tests {
             format!("wpkh({})", receive.public_key(&secp)),
             format!("wpkh({})", change.public_key(&secp)),
         )
+    }
+
+    fn sign_psbt_with_descriptors(
+        psbt: &mut Psbt,
+        receive_descriptor: &str,
+        change_descriptor: &str,
+    ) -> bool {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (receive_descriptor, receive_key_map) = receive_descriptor
+            .into_wallet_descriptor(&secp, bitcoin::NetworkKind::Test)
+            .unwrap();
+        let (change_descriptor, change_key_map) = change_descriptor
+            .into_wallet_descriptor(&secp, bitcoin::NetworkKind::Test)
+            .unwrap();
+        let receive_signers = SignersContainer::build(receive_key_map, &receive_descriptor, &secp);
+        let change_signers = SignersContainer::build(change_key_map, &change_descriptor, &secp);
+        let signer = Wallet::create(
+            receive_descriptor.to_string(),
+            change_descriptor.to_string(),
+        )
+        .network(Network::Testnet)
+        .create_wallet_no_persist()
+        .unwrap();
+        signer
+            .sign_with_signers(
+                psbt,
+                &[&receive_signers, &change_signers],
+                SignOptions {
+                    trust_witness_utxo: true,
+                    try_finalize: false,
+                    ..SignOptions::default()
+                },
+            )
+            .unwrap()
     }
 
     fn paying_block(parent: BlockHash, address: &str, value: u64) -> Block {
@@ -1978,20 +2013,7 @@ mod tests {
             })
             .unwrap();
         let mut partial = Psbt::from_str(&created.psbt).unwrap();
-        let signer = Wallet::create(private_receive, private_change)
-            .network(Network::Testnet)
-            .create_wallet_no_persist()
-            .unwrap();
-        let complete = signer
-            .sign(
-                &mut partial,
-                SignOptions {
-                    trust_witness_utxo: true,
-                    try_finalize: false,
-                    ..SignOptions::default()
-                },
-            )
-            .unwrap();
+        let complete = sign_psbt_with_descriptors(&mut partial, &private_receive, &private_change);
         assert!(!complete);
         assert!(partial.inputs.iter().all(|input| {
             !input.partial_sigs.is_empty()
@@ -2062,19 +2084,8 @@ mod tests {
             })
             .unwrap();
         let mut partial = Psbt::from_str(&created.psbt).unwrap();
-        Wallet::create(private_receive, private_change)
-            .network(Network::Testnet)
-            .create_wallet_no_persist()
-            .unwrap()
-            .sign(
-                &mut partial,
-                SignOptions {
-                    trust_witness_utxo: true,
-                    try_finalize: false,
-                    ..SignOptions::default()
-                },
-            )
-            .unwrap();
+        let complete = sign_psbt_with_descriptors(&mut partial, &private_receive, &private_change);
+        assert!(!complete);
 
         let mut wrong_prevout = partial.clone();
         wrong_prevout.inputs[0].witness_utxo.as_mut().unwrap().value += Amount::from_sat(1);
