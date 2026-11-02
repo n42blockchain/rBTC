@@ -145,6 +145,13 @@ fn state_directory(output: &Path) -> Result<PathBuf, SnapshotDownloadError> {
 fn write_manifest(path: &Path, manifest: &ResumeManifest) -> Result<(), SnapshotDownloadError> {
     let encoded = serde_json::to_vec(manifest)?;
     let temporary = path.with_extension("json.tmp");
+    // A crash between creating the temporary and renaming it leaves a stale
+    // file behind; `create_new` would then fail every later resume attempt.
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -412,6 +419,23 @@ mod tests {
                 Err(SnapshotDownloadError::Invalid(_))
             ));
         }
+    }
+
+    #[test]
+    fn stale_manifest_temporary_from_a_crash_does_not_block_resume() {
+        let directory = TempDir::new().unwrap();
+        let config = SnapshotDownloadConfig {
+            source: "https://example.com/one".to_owned(),
+            output: directory.path().join("snapshot.dat"),
+            expected_bytes: 10,
+            workers: 1,
+            chunk_bytes: 4,
+        };
+        let state = state_directory(&config.output).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(state.join("manifest.json.tmp"), b"{ partial").unwrap();
+        prepare_state(&config).unwrap();
+        assert!(state.join("manifest.json").exists());
     }
 
     #[test]
