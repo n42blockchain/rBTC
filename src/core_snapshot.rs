@@ -1169,10 +1169,12 @@ pub(crate) fn read_core_varint(reader: &mut impl Read) -> Result<u64, CoreSnapsh
     let mut value = 0_u64;
     loop {
         let byte = read_byte(reader)?;
-        value = value
-            .checked_shl(7)
-            .and_then(|shifted| shifted.checked_add(u64::from(byte & 0x7f)))
-            .ok_or(CoreSnapshotError::Invalid("VARINT overflow"))?;
+        // `checked_shl` only rejects oversized shift counts, not lost high bits,
+        // so mirror Core's explicit `n > max >> 7` guard.
+        if value > (u64::MAX >> 7) {
+            return Err(CoreSnapshotError::Invalid("VARINT overflow"));
+        }
+        value = (value << 7) | u64::from(byte & 0x7f);
         if byte & 0x80 == 0 {
             return Ok(value);
         }
@@ -1400,6 +1402,21 @@ mod tests {
 
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn core_varint_rejects_values_that_overflow_u64() {
+        // Eleven groups would shift the first group's bits out of a u64.
+        let mut overflowing = vec![0x81_u8; 10];
+        overflowing.push(0x00);
+        assert!(read_core_varint(&mut Cursor::new(overflowing)).is_err());
+        // The largest value Core accepts still round-trips.
+        let mut encoded = Vec::new();
+        write_core_varint(&mut encoded, u64::MAX);
+        assert_eq!(
+            read_core_varint(&mut Cursor::new(encoded)).unwrap(),
+            u64::MAX
+        );
+    }
 
     fn metadata_bytes(network: Network, base: BlockHash, coins_count: u64) -> Vec<u8> {
         let mut bytes = Vec::new();
