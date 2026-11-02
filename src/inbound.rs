@@ -1868,18 +1868,13 @@ async fn serve_filter_checkpoints(
             "compact-filter stop hash is not active",
         ))?;
     let mut filter_headers = Vec::new();
-    let mut height = FILTER_HEADER_INTERVAL - 1;
-    while height <= stop_height {
+    for height in filter_checkpoint_heights(stop_height) {
         let Some(filter) = source.basic_filter(height).map_err(InboundError::Data)? else {
             return Err(InboundError::Data(format!(
                 "basic filter index is unavailable at height {height}"
             )));
         };
         filter_headers.push(filter.filter_header);
-        let Some(next) = height.checked_add(FILTER_HEADER_INTERVAL) else {
-            break;
-        };
-        height = next;
     }
     send_accounted(
         peer,
@@ -1895,6 +1890,12 @@ async fn serve_filter_checkpoints(
     .await
 }
 
+/// BIP157 checkpoint heights for a `getcfcheckpt` ending at `stop_height`:
+/// every multiple of the interval from 1000 up to and including the stop.
+fn filter_checkpoint_heights(stop_height: u32) -> impl Iterator<Item = u32> {
+    (1..=stop_height / FILTER_HEADER_INTERVAL).map(|index| index * FILTER_HEADER_INTERVAL)
+}
+
 fn is_recent_block(source: &dyn InboundDataSource, hash: BlockHash) -> Result<bool, InboundError> {
     let tip = source.start_height().map_err(InboundError::Data)?;
     let Some(height) = source.active_height(hash).map_err(InboundError::Data)? else {
@@ -1905,6 +1906,21 @@ fn is_recent_block(source: &dyn InboundDataSource, hash: BlockHash) -> Result<bo
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cfcheckpt_heights_follow_bip157_multiples_of_one_thousand() {
+        use super::filter_checkpoint_heights;
+        assert_eq!(filter_checkpoint_heights(0).count(), 0);
+        assert_eq!(filter_checkpoint_heights(999).count(), 0);
+        assert_eq!(
+            filter_checkpoint_heights(1_000).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+        assert_eq!(
+            filter_checkpoint_heights(2_999).collect::<Vec<_>>(),
+            vec![1_000, 2_000]
+        );
+    }
+
     use super::*;
     use crate::p2p::{TransactionRelay, connect_outbound};
     use bitcoin::{
